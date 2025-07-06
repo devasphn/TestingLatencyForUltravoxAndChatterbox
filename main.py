@@ -32,13 +32,24 @@ logger = logging.getLogger(__name__)
 logging.getLogger('aioice.ice').setLevel(logging.WARNING)
 logging.getLogger('aiortc').setLevel(logging.WARNING)
 logging.getLogger('websockets').setLevel(logging.WARNING)
-logging.getLogger('transformers.modeling_utils').setLevel(logging.ERROR) # Suppress potential model warnings
+logging.getLogger('transformers.modeling_utils').setLevel(logging.ERROR) 
 
 # --- Global Variables & HTML ---
 uv_pipe, tts_model, vad_model = None, None, None
 executor = ThreadPoolExecutor(max_workers=4)
 pcs = set()
 ws_clients = set() 
+
+# --- System Prompt Definition ---
+# This is a critical instruction to guide the model's behavior.
+# We'll try to inject this into the pipeline input.
+SYSTEM_PROMPT = (
+    "You are a helpful AI assistant. Respond ONLY in English. "
+    "Do not respond in French, Arabic, or any other language. "
+    "If you cannot understand the user's input, politely ask them to repeat or rephrase in English. "
+    "Keep your responses concise and directly address the user's query."
+)
+# --- End System Prompt Definition ---
 
 HTML_CLIENT = """
 <!DOCTYPE html>
@@ -218,32 +229,27 @@ def initialize_models():
     try:
         logger.info("📥 Loading Ultravox pipeline...")
         
-        # --- SYSTEM PROMPT IMPLEMENTATION ---
-        # The exact method to pass a system prompt depends on the pipeline's implementation.
-        # Common patterns:
-        # 1. As a separate argument: pipeline(..., system_prompt="...")
-        # 2. Within the input dict: {"system_prompt": "...", "audio": ...}
-        # 3. Prepending to the first user message (less ideal for pipeline)
-        #
-        # Let's try passing it as a keyword argument if the pipeline supports it.
-        # If this fails, we might need to modify the pipeline's internal code or the input structure.
+        # --- SYSTEM PROMPT IMPLEMENTATION (REVISED STRATEGY) ---
+        # Since passing `system_prompt` directly to pipeline might not work for custom pipelines,
+        # we will try to inject the system prompt into the *input dictionary* itself,
+        # assuming the pipeline's internal preprocessing looks for specific keys like 'system_prompt'.
+        # If this doesn't work, we might need to dig into `ultravox_pipeline.py`.
         
-        # IMPORTANT: You might need to adjust the system prompt based on Ultravox's expected format.
-        # Common prompt examples:
-        SYSTEM_PROMPT = "You are a helpful AI assistant. Speak only in English. Respond clearly and concisely to the user's requests."
-        # SYSTEM_PROMPT = "You are an English-speaking AI assistant. Respond only in English. Do not respond in French or any other language. Keep responses brief."
+        # Define the system prompt for English-only, concise responses.
+        SYSTEM_PROMPT = (
+            "You are a helpful AI assistant. Respond ONLY in English. "
+            "Do not respond in French, Arabic, or any other language. "
+            "If you cannot understand the user's input, politely ask them to repeat or rephrase in English. "
+            "Keep your responses concise and directly address the user's query."
+        )
         
         uv_pipe = pipeline(
             model="fixie-ai/ultravox-v0_4", 
             trust_remote_code=True, 
             device_map="auto", 
-            torch_dtype=torch.float16,
-            # --- Attempting to pass system prompt ---
-            # NOTE: This might not work if the pipeline doesn't explicitly support it.
-            # Check the model's documentation or `ultravox_pipeline.py` for confirmation.
-            # If it doesn't work, we'll need a more advanced injection method.
-            system_prompt=SYSTEM_PROMPT 
-            # --- End Attempt ---
+            torch_dtype=torch.float16
+            # Removed system_prompt here as it might not be directly supported by the pipeline call signature.
+            # We will inject it into the input dictionary instead.
         )
         logger.info("✅ Ultravox pipeline loaded successfully")
 
@@ -364,19 +370,23 @@ class AudioProcessor:
 
     async def process_speech(self, audio_array):
         try:
+            # --- REVISED SYSTEM PROMPT INJECTION ---
+            # Trying to inject the system prompt into the 'turns' list.
+            # This is a heuristic, as the exact format expected by the custom pipeline is unknown.
             pipeline_input = {
                 "audio": audio_array,
                 "sampling_rate": 16000,
-                "turns": [] 
+                # Assume 'turns' expects a list of dictionaries, where each dict represents a turn.
+                # We add the system prompt as the first turn.
+                "turns": [
+                    {"role": "system", "content": SYSTEM_PROMPT}, 
+                    {"role": "user", "content": ""} # Placeholder for actual user input if needed later
+                ] 
             }
-            
-            # --- System Prompt Handling ---
-            # If the pipeline doesn't directly support 'system_prompt' argument,
-            # we might need to prepend it to the input or modify the pipeline logic.
-            # For now, we assume the pipeline might pick it up if passed during initialization.
-            # If the 'system_prompt' parameter during pipeline creation doesn't work, 
-            # we'd need to investigate the custom pipeline code ('ultravox_pipeline.py')
-            # to see how it expects system instructions.
+            # NOTE: The actual user audio data might need to be associated with the 'user' role,
+            # or the pipeline might handle it separately. This structure is based on common
+            # conversational LLM input formats. If this doesn't work, we might need to
+            # inspect 'ultravox_pipeline.py' for the correct input format.
             
             with torch.inference_mode(): 
                 result = uv_pipe(pipeline_input, max_new_tokens=50) 
