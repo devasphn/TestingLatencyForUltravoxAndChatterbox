@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger('aioice.ice').setLevel(logging.WARNING)
 logging.getLogger('aiortc').setLevel(logging.WARNING)
 logging.getLogger('websockets').setLevel(logging.WARNING)
+logging.getLogger('transformers.modeling_utils').setLevel(logging.ERROR) # Suppress potential model warnings if not critical
 
 # --- Global Variables & HTML ---
 uv_pipe, tts_model, vad_model = None, None, None
@@ -190,7 +191,6 @@ class SileroVAD:
             logger.info("✅ Silero VAD loaded successfully")
         except Exception as e:
             logger.error(f"❌ Error loading Silero VAD: {e}", exc_info=True)
-            # self.model remains None
 
     def detect_speech(self, audio_tensor, sample_rate=16000):
         if self.model is None: 
@@ -337,16 +337,16 @@ class AudioProcessor:
 
     async def process_speech(self, audio_array):
         try:
-            # --- CRITICAL FIX: Pass audio_array as a dictionary to the pipeline ---
+            # --- Ensure correct dictionary format for the pipeline ---
             pipeline_input = {
                 "audio": audio_array,
                 "sampling_rate": 16000,
-                "turns": [] # As indicated by the error traceback
+                "turns": [] 
             }
             
             with torch.inference_mode(): 
-                result = uv_pipe(pipeline_input, max_new_tokens=50)
-            # --- End CRITICAL FIX ---
+                # Pass the dictionary input to the pipeline
+                result = uv_pipe(pipeline_input, max_new_tokens=50) 
 
             response_text = parse_ultravox_response(result).strip()
             if not response_text: return
@@ -377,7 +377,7 @@ class AudioProcessor:
 async def websocket_handler(request):
     ws = web.WebSocketResponse(heartbeat=30)
     await ws.prepare(request)
-    ws_clients.add(ws) # Add to global set
+    ws_clients.add(ws) 
     
     pc = RTCPeerConnection(RTCConfiguration([RTCIceServer(urls="stun:stun.l.google.com:19302")]))
     pcs.add(pc)
@@ -414,7 +414,6 @@ async def websocket_handler(request):
                         candidate_data = data["candidate"]
                         candidate_string = candidate_data.get("candidate")
                         if candidate_string:
-                            # CRITICAL FIX: Check if remote description is set before adding candidate
                             if pc.remoteDescription: 
                                 params = candidate_from_sdp(candidate_string)
                                 candidate = RTCIceCandidate(sdpMid=candidate_data.get("sdpMid"), sdpMLineIndex=candidate_data.get("sdpMLineIndex"), **params)
@@ -448,7 +447,7 @@ async def cleanup_connection(pc, audio_processor, ws):
     if pc in pcs:
         pcs.remove(pc)
         
-    if ws and ws in ws_clients: # Use the global set
+    if ws and ws in ws_clients: 
         ws_clients.discard(ws)
         if not ws.closed:
              await ws.close()
@@ -465,7 +464,7 @@ async def on_shutdown(app):
             await pc_conn.close()
     pcs.clear()
     
-    for ws_conn in list(ws_clients): # Use the global set
+    for ws_conn in list(ws_clients): 
         if not ws_conn.closed:
             await ws_conn.close(code=1001, message="Server shutting down")
     ws_clients.clear()
