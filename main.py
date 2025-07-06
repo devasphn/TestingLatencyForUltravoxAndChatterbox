@@ -41,8 +41,6 @@ pcs = set()
 ws_clients = set() 
 
 # --- System Prompt Definition ---
-# This is a critical instruction to guide the model's behavior.
-# We'll try to inject this into the pipeline input.
 SYSTEM_PROMPT = (
     "You are a helpful AI assistant. Respond ONLY in English. "
     "Do not respond in French, Arabic, or any other language. "
@@ -229,12 +227,6 @@ def initialize_models():
     try:
         logger.info("📥 Loading Ultravox pipeline...")
         
-        # --- SYSTEM PROMPT IMPLEMENTATION (REVISED STRATEGY) ---
-        # Since passing `system_prompt` directly to pipeline might not work for custom pipelines,
-        # we will try to inject the system prompt into the *input dictionary* itself,
-        # assuming the pipeline's internal preprocessing looks for specific keys like 'system_prompt'.
-        # If this doesn't work, we might need to dig into `ultravox_pipeline.py`.
-        
         # Define the system prompt for English-only, concise responses.
         SYSTEM_PROMPT = (
             "You are a helpful AI assistant. Respond ONLY in English. "
@@ -248,8 +240,6 @@ def initialize_models():
             trust_remote_code=True, 
             device_map="auto", 
             torch_dtype=torch.float16
-            # Removed system_prompt here as it might not be directly supported by the pipeline call signature.
-            # We will inject it into the input dictionary instead.
         )
         logger.info("✅ Ultravox pipeline loaded successfully")
 
@@ -370,26 +360,26 @@ class AudioProcessor:
 
     async def process_speech(self, audio_array):
         try:
-            # --- REVISED SYSTEM PROMPT INJECTION ---
-            # Trying to inject the system prompt into the 'turns' list.
-            # This is a heuristic, as the exact format expected by the custom pipeline is unknown.
+            # --- REVISED SYSTEM PROMPT INJECTION into input dictionary ---
+            # The pipeline might expect the system prompt to be part of the 'turns' list.
+            # Let's structure it as a list of turns, with the system prompt first.
             pipeline_input = {
-                "audio": audio_array,
-                "sampling_rate": 16000,
-                # Assume 'turns' expects a list of dictionaries, where each dict represents a turn.
-                # We add the system prompt as the first turn.
                 "turns": [
-                    {"role": "system", "content": SYSTEM_PROMPT}, 
-                    {"role": "user", "content": ""} # Placeholder for actual user input if needed later
-                ] 
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "audio": audio_array} # Embed audio within the user turn
+                ],
+                # 'sampling_rate' might be needed as a separate keyword argument, 
+                # or potentially within the audio data structure itself if the pipeline expects it.
+                # Let's pass it as a keyword argument to the pipeline call.
             }
-            # NOTE: The actual user audio data might need to be associated with the 'user' role,
-            # or the pipeline might handle it separately. This structure is based on common
-            # conversational LLM input formats. If this doesn't work, we might need to
-            # inspect 'ultravox_pipeline.py' for the correct input format.
             
             with torch.inference_mode(): 
-                result = uv_pipe(pipeline_input, max_new_tokens=50) 
+                # Pass sampling_rate as a keyword argument if not handled within the dictionary
+                result = uv_pipe(
+                    pipeline_input, 
+                    sampling_rate=16000, 
+                    max_new_tokens=50
+                ) 
 
             response_text = parse_ultravox_response(result).strip()
             if not response_text: return
@@ -411,6 +401,12 @@ class AudioProcessor:
                 self.is_speaking = False
                 logger.info("✅ AI finished speaking, now listening.")
 
+        except ValueError as ve:
+            # Catch the specific ValueError related to placeholders
+            logger.error(f"ValueError during speech processing: {ve}. This might indicate incorrect input formatting for the pipeline.")
+            # Attempt to provide a fallback response or inform the user
+            await send_transcription_to_client("AI Error: Could not process audio input correctly.", 'system')
+            self.is_speaking = False # Ensure state is reset
         except Exception as e:
             logger.error(f"Speech processing error: {e}", exc_info=True)
             self.is_speaking = False # Ensure we reset state on error
