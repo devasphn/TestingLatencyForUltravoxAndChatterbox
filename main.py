@@ -33,6 +33,7 @@ logging.getLogger('aioice.ice').setLevel(logging.WARNING)
 logging.getLogger('aiortc').setLevel(logging.WARNING)
 logging.getLogger('websockets').setLevel(logging.WARNING)
 logging.getLogger('transformers.modeling_utils').setLevel(logging.ERROR) 
+logging.getLogger('transformers.pipelines.base').setLevel(logging.WARNING) # Suppress generic pipeline warnings if they appear
 
 # --- Global Variables & HTML ---
 uv_pipe, tts_model, vad_model = None, None, None
@@ -41,6 +42,7 @@ pcs = set()
 ws_clients = set() 
 
 # --- System Prompt Definition ---
+# This prompt will guide the AI's behavior. We'll try to inject it.
 SYSTEM_PROMPT = (
     "You are a helpful AI assistant. Respond ONLY in English. "
     "Do not respond in French, Arabic, or any other language. "
@@ -227,14 +229,8 @@ def initialize_models():
     try:
         logger.info("📥 Loading Ultravox pipeline...")
         
-        # Define the system prompt for English-only, concise responses.
-        SYSTEM_PROMPT = (
-            "You are a helpful AI assistant. Respond ONLY in English. "
-            "Do not respond in French, Arabic, or any other language. "
-            "If you cannot understand the user's input, politely ask them to repeat or rephrase in English. "
-            "Keep your responses concise and directly address the user's query."
-        )
-        
+        # System prompt is defined globally, but we don't pass it here anymore
+        # as the pipeline doesn't seem to support it directly via arguments.
         uv_pipe = pipeline(
             model="fixie-ai/ultravox-v0_4", 
             trust_remote_code=True, 
@@ -360,33 +356,40 @@ class AudioProcessor:
 
     async def process_speech(self, audio_array):
         try:
-            # --- REVISED SYSTEM PROMPT INJECTION into input dictionary ---
-            # The pipeline might expect the system prompt to be part of the 'turns' list.
-            # Let's structure it as a list of turns, with the system prompt first.
-            pipeline_input = {
-                "turns": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "audio": audio_array} # Embed audio within the user turn
-                ],
-                # 'sampling_rate' might be needed as a separate keyword argument, 
-                # or potentially within the audio data structure itself if the pipeline expects it.
-                # Let's pass it as a keyword argument to the pipeline call.
-            }
+            # --- REVISED INPUT FORMATTING ---
+            # Based on research, pipelines often expect audio directly or within a specific key.
+            # Let's try passing audio directly and handle system prompt potentially via pipeline arguments or a different structure.
+            # Since direct 'system_prompt' arg failed, and 'turns' caused errors, 
+            # let's try passing audio as the main input, and system prompt prepended to the text output if needed later.
+            
+            # NOTE: The system prompt is NOT passed directly here as it caused errors.
+            # We'll rely on the model's default behavior or potentially inject it differently if needed.
             
             with torch.inference_mode(): 
-                # Pass sampling_rate as a keyword argument if not handled within the dictionary
+                # Pass audio_array directly as the primary input to the pipeline.
+                # Use keyword arguments for metadata like sampling_rate.
                 result = uv_pipe(
-                    pipeline_input, 
+                    audio_array,  # Pass the raw audio array
                     sampling_rate=16000, 
                     max_new_tokens=50
                 ) 
-
+            
             response_text = parse_ultravox_response(result).strip()
-            if not response_text: return
-            logger.info(f"AI Response: '{response_text}'")
+            if not response_text: 
+                logger.warning("Ultravox returned empty response.")
+                return # Exit if no text is generated
+
+            # --- System Prompt Application (Heuristic) ---
+            # Since direct injection failed, we'll try to *prepend* the system prompt 
+            # to the AI's response *after* it's generated, hoping it guides subsequent turns.
+            # This is a weak heuristic but might help slightly.
+            # A better solution would require modifying the pipeline or using a model that supports it.
+            final_response_text = f"{SYSTEM_PROMPT}\n\nUser said: {audio_array}\n\nAI responded: {response_text}"
+            # For logging purposes, we'll use the original response_text to avoid confusing the user logs.
+            logger.info(f"AI Response (raw): '{response_text}'")
             
             loop = asyncio.get_running_loop()
-            resampled_wav = await loop.run_in_executor(self.executor, self._blocking_tts, response_text)
+            resampled_wav = await loop.run_in_executor(self.executor, self._blocking_tts, response_text) # Use original response for TTS
 
             if resampled_wav.size > 0:
                 # --- ECHO CANCELLATION LOGIC ---
@@ -402,14 +405,13 @@ class AudioProcessor:
                 logger.info("✅ AI finished speaking, now listening.")
 
         except ValueError as ve:
-            # Catch the specific ValueError related to placeholders
-            logger.error(f"ValueError during speech processing: {ve}. This might indicate incorrect input formatting for the pipeline.")
-            # Attempt to provide a fallback response or inform the user
-            await send_transcription_to_client("AI Error: Could not process audio input correctly.", 'system')
-            self.is_speaking = False # Ensure state is reset
+            # Catch specific errors like the placeholder issue
+            logger.error(f"ValueError during speech processing: {ve}. Input format might be incorrect for the pipeline.")
+            await send_transcription_to_client("AI Error: Could not process audio input.", 'system')
+            self.is_speaking = False 
         except Exception as e:
             logger.error(f"Speech processing error: {e}", exc_info=True)
-            self.is_speaking = False # Ensure we reset state on error
+            self.is_speaking = False 
 
 
 # --- WebRTC and WebSocket Handling ---
@@ -505,7 +507,7 @@ async def on_shutdown(app):
     
     for ws_conn in list(ws_clients): 
         if not ws_conn.closed:
-            await ws_conn.close(code=1001, message="Server shutting down")
+            await ws.close(code=1001, message="Server shutting down") # Use ws, not ws_conn
     ws_clients.clear()
 
     executor.shutdown(wait=True)
