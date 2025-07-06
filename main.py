@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger('aioice.ice').setLevel(logging.WARNING)
 logging.getLogger('aiortc').setLevel(logging.WARNING)
 logging.getLogger('websockets').setLevel(logging.WARNING)
-logging.getLogger('transformers.modeling_utils').setLevel(logging.ERROR) # Suppress potential model warnings if not critical
+logging.getLogger('transformers.modeling_utils').setLevel(logging.ERROR) # Suppress potential model warnings
 
 # --- Global Variables & HTML ---
 uv_pipe, tts_model, vad_model = None, None, None
@@ -217,7 +217,34 @@ def initialize_models():
         
     try:
         logger.info("📥 Loading Ultravox pipeline...")
-        uv_pipe = pipeline(model="fixie-ai/ultravox-v0_4", trust_remote_code=True, device_map="auto", torch_dtype=torch.float16)
+        
+        # --- SYSTEM PROMPT IMPLEMENTATION ---
+        # The exact method to pass a system prompt depends on the pipeline's implementation.
+        # Common patterns:
+        # 1. As a separate argument: pipeline(..., system_prompt="...")
+        # 2. Within the input dict: {"system_prompt": "...", "audio": ...}
+        # 3. Prepending to the first user message (less ideal for pipeline)
+        #
+        # Let's try passing it as a keyword argument if the pipeline supports it.
+        # If this fails, we might need to modify the pipeline's internal code or the input structure.
+        
+        # IMPORTANT: You might need to adjust the system prompt based on Ultravox's expected format.
+        # Common prompt examples:
+        SYSTEM_PROMPT = "You are a helpful AI assistant. Speak only in English. Respond clearly and concisely to the user's requests."
+        # SYSTEM_PROMPT = "You are an English-speaking AI assistant. Respond only in English. Do not respond in French or any other language. Keep responses brief."
+        
+        uv_pipe = pipeline(
+            model="fixie-ai/ultravox-v0_4", 
+            trust_remote_code=True, 
+            device_map="auto", 
+            torch_dtype=torch.float16,
+            # --- Attempting to pass system prompt ---
+            # NOTE: This might not work if the pipeline doesn't explicitly support it.
+            # Check the model's documentation or `ultravox_pipeline.py` for confirmation.
+            # If it doesn't work, we'll need a more advanced injection method.
+            system_prompt=SYSTEM_PROMPT 
+            # --- End Attempt ---
+        )
         logger.info("✅ Ultravox pipeline loaded successfully")
 
         logger.info("📥 Loading Chatterbox TTS...")
@@ -337,15 +364,21 @@ class AudioProcessor:
 
     async def process_speech(self, audio_array):
         try:
-            # --- Ensure correct dictionary format for the pipeline ---
             pipeline_input = {
                 "audio": audio_array,
                 "sampling_rate": 16000,
                 "turns": [] 
             }
             
+            # --- System Prompt Handling ---
+            # If the pipeline doesn't directly support 'system_prompt' argument,
+            # we might need to prepend it to the input or modify the pipeline logic.
+            # For now, we assume the pipeline might pick it up if passed during initialization.
+            # If the 'system_prompt' parameter during pipeline creation doesn't work, 
+            # we'd need to investigate the custom pipeline code ('ultravox_pipeline.py')
+            # to see how it expects system instructions.
+            
             with torch.inference_mode(): 
-                # Pass the dictionary input to the pipeline
                 result = uv_pipe(pipeline_input, max_new_tokens=50) 
 
             response_text = parse_ultravox_response(result).strip()
