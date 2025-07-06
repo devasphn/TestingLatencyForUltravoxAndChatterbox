@@ -14,10 +14,7 @@ from aiohttp import web, WSMsgType
 from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack, RTCIceCandidate, RTCConfiguration, RTCIceServer, mediastreams
 import av
 
-# --- CRITICAL FIX: Ensure 'pipeline' is imported ---
-from transformers import pipeline 
-# --- End CRITICAL FIX ---
-
+from transformers import pipeline
 from chatterbox.tts import ChatterboxTTS
 import torch.hub
 
@@ -34,12 +31,16 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 logging.getLogger('aioice.ice').setLevel(logging.WARNING)
 logging.getLogger('aiortc').setLevel(logging.WARNING)
-logging.getLogger('websockets').setLevel(logging.WARNING) # Suppress verbose websocket logs
+logging.getLogger('websockets').setLevel(logging.WARNING)
 
 # --- Global Variables & HTML ---
 uv_pipe, tts_model, vad_model = None, None, None
 executor = ThreadPoolExecutor(max_workers=4)
 pcs = set()
+# --- CRITICAL FIX: Declare ws_clients globally ---
+ws_clients = set() 
+# --- End CRITICAL FIX ---
+
 HTML_CLIENT = """
 <!DOCTYPE html>
 <html>
@@ -126,7 +127,9 @@ HTML_CLIENT = """
             ws.onopen = async () => {
                 const offer = await pc.createOffer();
                 await pc.setLocalDescription(offer);
-                ws.send(JSON.JSON.stringify(offer)); // Corrected: was JSON.stringify(offer)
+                // --- CRITICAL FIX: Corrected typo in JSON.stringify ---
+                ws.send(JSON.stringify(offer)); 
+                // --- End CRITICAL FIX ---
             };
 
             ws.onmessage = async e => {
@@ -134,6 +137,7 @@ HTML_CLIENT = """
                 if (data.type === 'answer' && !pc.currentRemoteDescription) {
                     await pc.setRemoteDescription(new RTCSessionDescription(data));
                 }
+                // NOTE: If the server sends ICE candidates via WebSocket, handle them here too.
             };
 
             const closeHandler = () => { if (pc && pc.connectionState !== 'closed') stop(); };
@@ -190,24 +194,18 @@ class SileroVAD:
             (self.get_speech_timestamps, _, _, _, _) = utils
             logger.info("✅ Silero VAD loaded successfully")
         except Exception as e:
-            # Log the error but don't raise, allowing initialize_models to handle the failure.
             logger.error(f"❌ Error loading Silero VAD: {e}", exc_info=True)
             # self.model remains None
 
     def detect_speech(self, audio_tensor, sample_rate=16000):
-        # IMPORTANT CHECK: Only proceed if the model was loaded successfully
+        # CRITICAL CHECK: Only proceed if the model was loaded successfully
         if self.model is None: 
-            # If VAD model failed to load, we'll assume speech is present to allow processing.
-            # This will likely increase latency as silence might be processed.
-            # A more robust fallback might involve basic energy detection here.
-            # logger.warning("VAD model not loaded, assuming speech is present.") # Avoid excessive warnings
+            # Fallback if VAD failed to load. Process based on buffer size/time.
             return True 
         try:
             if isinstance(audio_tensor, np.ndarray): audio_tensor = torch.from_numpy(audio_tensor)
-            # Basic silence check
-            if audio_tensor.abs().max() < 0.01: return False
+            if audio_tensor.abs().max() < 0.01: return False # Silence check
             
-            # Run VAD
             speech_timestamps = self.get_speech_timestamps(audio_tensor, self.model, sampling_rate=sample_rate, min_speech_duration_ms=250)
             return len(speech_timestamps) > 0
         except Exception as e:
@@ -219,16 +217,14 @@ def initialize_models():
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     logger.info(f"🚀 Initializing models on device: {device}")
     
-    # Initialize VAD first
     vad_model = SileroVAD()
-    # CRITICAL CHECK: If VAD model failed to load, return False to stop initialization
+    # CRITICAL CHECK: If VAD model failed to load, stop initialization.
     if vad_model.model is None:
         logger.error("Silero VAD model failed to load. Cannot proceed.")
         return False
         
     try:
         logger.info("📥 Loading Ultravox pipeline...")
-        # The 'pipeline' function is correctly imported from 'transformers'
         uv_pipe = pipeline(model="fixie-ai/ultravox-v0_4", trust_remote_code=True, device_map="auto", torch_dtype=torch.float16)
         logger.info("✅ Ultravox pipeline loaded successfully")
 
@@ -239,7 +235,6 @@ def initialize_models():
         logger.info("🎉 All models loaded successfully!")
         return True
     except Exception as e:
-        # If Ultravox or TTS fails after VAD loaded, log the error and return False
         logger.error(f"❌ Critical model loading error: {e}", exc_info=True)
         return False
 
@@ -263,11 +258,11 @@ class AudioBuffer:
             self.last_process_time = current_time
             audio_array = self.get_audio_array()
             if np.abs(audio_array).max() < 0.005: return False
-            # Ensure vad_model is not None before calling detect_speech
-            if vad_model and vad_model.model: # Check if VAD model was loaded
+            # Check if VAD model is available before calling it
+            if vad_model and vad_model.model: 
                  return vad_model.detect_speech(audio_array, self.sample_rate)
             else:
-                 # Fallback if VAD failed to load: process based on buffer size and time
+                 # Fallback if VAD is not loaded
                  return True 
         return False
 
@@ -306,10 +301,9 @@ class ResponseAudioTrack(MediaStreamTrack):
         if audio_float32.size > 0: await self._queue.put((audio_float32 * 32767).astype(np.int16))
 
 class AudioProcessor:
-    # --- ECHO CANCELLATION LOGIC ---
     def __init__(self, output_track: ResponseAudioTrack, executor: ThreadPoolExecutor):
         self.track, self.buffer, self.output_track, self.task, self.executor = None, AudioBuffer(), output_track, None, executor
-        self.is_speaking = False # The new state variable
+        self.is_speaking = False # State variable for echo cancellation
 
     def add_track(self, track): self.track = track
     async def start(self): self.task = asyncio.create_task(self._run())
@@ -322,7 +316,7 @@ class AudioProcessor:
                 # --- ECHO CANCELLATION LOGIC ---
                 if self.is_speaking:
                     try:
-                        await asyncio.wait_for(self.track.recv(), timeout=0.01)
+                        await asyncio.wait_for(self.track.recv(), timeout=0.01) # Drain frames
                     except asyncio.TimeoutError:
                         await asyncio.sleep(0.01) 
                     continue
@@ -354,11 +348,7 @@ class AudioProcessor:
 
     async def process_speech(self, audio_array):
         try:
-            with torch.inference_mode(): 
-                # Ensure pipeline is called correctly. If it expects specific dict keys, adjust here.
-                # For example, if it expects {'audio': audio_array, ...}, use that.
-                # Assuming pipeline handles dict input like {'audio': ..., 'sampling_rate': ...}
-                result = uv_pipe(audio_array, sampling_rate=16000, max_new_tokens=50) # Adjusted call if needed
+            with torch.inference_mode(): result = uv_pipe(audio_array, sampling_rate=16000, max_new_tokens=50) # Ensure correct pipeline call
             response_text = parse_ultravox_response(result).strip()
             if not response_text: return
             logger.info(f"AI Response: '{response_text}'")
@@ -388,6 +378,9 @@ class AudioProcessor:
 async def websocket_handler(request):
     ws = web.WebSocketResponse(heartbeat=30)
     await ws.prepare(request)
+    # --- CRITICAL FIX: Add ws to the global ws_clients set ---
+    ws_clients.add(ws)
+    # --- End CRITICAL FIX ---
     
     pc = RTCPeerConnection(RTCConfiguration([RTCIceServer(urls="stun:stun.l.google.com:19302")]))
     pcs.add(pc)
@@ -408,8 +401,7 @@ async def websocket_handler(request):
     async def on_connectionstatechange():
         logger.info(f"ICE Connection State is {pc.connectionState}")
         if pc.connectionState in ["failed", "closed", "disconnected"]:
-            # Ensure cleanup happens properly
-            await cleanup_connection(pc, processor, ws) 
+            await cleanup_connection(pc, processor, ws) # Use the helper for cleanup
 
     try:
         async for msg in ws:
@@ -419,50 +411,57 @@ async def websocket_handler(request):
                     await pc.setRemoteDescription(RTCSessionDescription(sdp=data["sdp"], type=data["type"]))
                     answer = await pc.createAnswer()
                     await pc.setLocalDescription(answer)
-                    await ws.send_json({"type": "answer", "sdp": pc.localDescription.sdp}) # Corrected: JSON.stringify was in JS, here it's send_json
+                    await ws.send_json({"type": "answer", "sdp": pc.localDescription.sdp})
                 elif data["type"] == "ice-candidate" and data.get("candidate"):
                     try:
                         candidate_data = data["candidate"]
                         candidate_string = candidate_data.get("candidate")
                         if candidate_string:
-                            params = candidate_from_sdp(candidate_string)
-                            candidate = RTCIceCandidate(sdpMid=candidate_data.get("sdpMid"), sdpMLineIndex=candidate_data.get("sdpMLineIndex"), **params)
-                            await pc.addIceCandidate(candidate)
+                            # --- CRITICAL FIX: Check if remote description is set before adding candidate ---
+                            if pc.remoteDescription: 
+                                params = candidate_from_sdp(candidate_string)
+                                candidate = RTCIceCandidate(sdpMid=candidate_data.get("sdpMid"), sdpMLineIndex=candidate_data.get("sdpMLineIndex"), **params)
+                                await pc.addIceCandidate(candidate)
+                            else:
+                                logger.warning("Received ICE candidate before remote description was set. Ignoring.")
+                            # --- End CRITICAL FIX ---
                     except Exception as e:
                         logger.error(f"Error adding ICE candidate: {e}", exc_info=True)
             elif msg.type == WSMsgType.ERROR:
                 logger.error(f"WebSocket error: {ws.exception()}")
-                await cleanup_connection(pc, processor, ws)
+                await cleanup_connection(pc, processor, ws) # Ensure cleanup on error
             elif msg.type == WSMsgType.CLOSE:
                 logger.info("WebSocket closed by client.")
-                await cleanup_connection(pc, processor, ws)
+                await cleanup_connection(pc, processor, ws) # Ensure cleanup on close
 
     except Exception as e:
         logger.error(f"WebSocket handler error: {e}", exc_info=True)
-        await cleanup_connection(pc, processor, ws)
+        await cleanup_connection(pc, processor, ws) # Ensure cleanup on unexpected errors
     finally:
-        # Final cleanup when the loop exits
+        # Final cleanup when the handler exits
         await cleanup_connection(pc, processor, ws)
     return ws
 
+# Helper to clean up connection resources
 async def cleanup_connection(pc, audio_processor, ws):
     """Helper function to clean up resources when a connection is lost."""
     logger.info("Cleaning up connection resources...")
     if audio_processor:
         await audio_processor.stop()
-        audio_processor = None # Clear reference
+        audio_processor = None
         
     if pc and pc.connectionState != "closed":
         await pc.close()
     if pc in pcs:
         pcs.remove(pc)
         
-    if ws and ws in ws_clients: # Assuming ws_clients is managed globally or passed correctly
+    # --- CRITICAL FIX: Check if ws is valid and in the global set ---
+    if ws and ws in ws_clients:
         ws_clients.discard(ws)
         if not ws.closed:
              await ws.close()
+    # --- End CRITICAL FIX ---
     logger.info("Connection resources cleaned up.")
-
 
 async def index_handler(request):
     return web.Response(text=HTML_CLIENT, content_type='text/html')
@@ -470,24 +469,22 @@ async def index_handler(request):
 # --- Main Application Logic ---
 async def on_shutdown(app):
     logger.info("Shutting down server...")
-    # Ensure all connections are properly closed
-    for pc_conn in list(pcs):
+    for pc_conn in list(pcs): 
         if pc_conn.connectionState != "closed":
             await pc_conn.close()
     pcs.clear()
     
-    # Close WebSockets if managed globally (assuming they are)
-    # If ws_clients is local to handler, this part might differ
+    # --- CRITICAL FIX: Use the global ws_clients set for cleanup ---
     for ws_conn in list(ws_clients): 
         if not ws_conn.closed:
             await ws_conn.close(code=1001, message="Server shutting down")
     ws_clients.clear()
+    # --- End CRITICAL FIX ---
 
     executor.shutdown(wait=True)
     logger.info("Shutdown complete.")
 
 async def main():
-    # Ensure models are initialized, exit if critical ones fail
     if not initialize_models():
         logger.error("Failed to initialize models. The application cannot start.")
         return
@@ -507,13 +504,11 @@ async def main():
         print("🚀 Your speech-to-speech agent is live!")
         print("   Press Ctrl+C to stop the server.")
         
-        # Keep the server running indefinitely
-        await asyncio.Event().wait()
+        await asyncio.Event().wait() # Keep server running
     except Exception as e:
         logger.error(f"Failed to start server: {e}", exc_info=True)
     finally:
-        # Ensure shutdown is called on any exit
-        await on_shutdown(app)
+        await on_shutdown(app) # Ensure shutdown on any exit
 
 if __name__ == "__main__":
     try:
