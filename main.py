@@ -14,19 +14,12 @@ from aiohttp import web, WSMsgType
 from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack, RTCIceCandidate, RTCConfiguration, RTCIceServer, mediastreams
 import av
 
+# --- Ensure these libraries are installed ---
+# pip install torch torchvision torchaudio numpy librosa aiohttp aiortc av transformers chatterbox-tts
+# For uvloop (optional but recommended): pip install uvloop
+
 # If you plan to use ONNX Runtime for optimized inference:
-# import onnxruntime as ort
-# import onnx
-# from onnx.numpy_helper import from_array
-
-# Assuming transformers and chatterbox are installed.
-# If using ONNX/TensorRT, you might need to install specific packages like:
-# pip install onnxruntime-gpu
-# pip install tensorrt
-
-from transformers import pipeline
-from chatterbox.tts import ChatterboxTTS # Make sure this is installed and accessible
-import torch.hub
+# pip install onnxruntime onnxruntime-gpu # (if using GPU)
 
 # --- Basic Setup ---
 try:
@@ -47,18 +40,19 @@ logging.getLogger('httpx').setLevel(logging.WARNING)
 logging.getLogger('websockets').setLevel(logging.WARNING)
 logging.getLogger('asyncio').setLevel(logging.WARNING)
 logging.getLogger('urllib3').setLevel(logging.WARNING)
+logging.getLogger('charset_normalizer').setLevel(logging.WARNING)
+logging.getLogger('safetensors.safetensors_ப்பட்டன').setLevel(logging.WARNING)
 
-# --- Global Variables & HTML ---
-uv_pipe, tts_model, vad_model = None, None, None
-# For ONNX/TensorRT, you might load session objects here:
-# uv_session, tts_session = None, None
-# uv_session_options, tts_session_options = None, None
 
-# Use a slightly smaller thread pool if CPU isn't the bottleneck for inference
-executor = ThreadPoolExecutor(max_workers=2) 
-pcs = set()
+# --- Global Variables ---
+uv_pipe = None
+tts_model = None
+vad_model = None
+executor = ThreadPoolExecutor(max_workers=2) # Reduced workers, inference is often GPU bound
+pcs = set() # Active RTCPeerConnections
+ws_clients = set() # Active WebSocket connections
 
-# --- Enhanced HTML Client ---
+# --- HTML Client ---
 HTML_CLIENT = """
 <!DOCTYPE html>
 <html lang="en">
@@ -80,6 +74,7 @@ HTML_CLIENT = """
             align-items: center;
             min-height: 100vh;
             box-sizing: border-box;
+            overflow-y: auto; /* Allow scrolling if content exceeds viewport */
         }
         .container {
             background: rgba(255, 255, 255, 0.1);
@@ -142,15 +137,43 @@ HTML_CLIENT = """
         .stop-btn:hover {
             background: linear-gradient(45deg, #ff6a88 0%, #ff9a8b 99%);
         }
+        .status-display {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-bottom: 25px;
+            font-size: 1.1em;
+            font-weight: 500;
+        }
+        .status-indicator {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            margin-right: 10px;
+            background-color: #ccc; /* Default */
+            animation: pulse 1.5s infinite ease-in-out;
+            flex-shrink: 0; /* Prevent shrinking */
+        }
+        .status-indicator.connected { background-color: #84fab0; animation-play-state: paused;}
+        .status-indicator.connecting { background-color: #fbc2eb; animation: pulse 1.5s infinite ease-in-out;}
+        .status-indicator.disconnected { background-color: #e74c3c; animation: pulse 1.5s infinite ease-in-out; animation-play-state: paused;}
+        .status-indicator.speaking { background-color: #8fd3f4; animation: pulse 1.5s infinite ease-in-out;}
+
+        @keyframes pulse {
+            0% { transform: scale(1); opacity: 1; }
+            50% { transform: scale(1.2); opacity: 0.7; }
+            100% { transform: scale(1); opacity: 1; }
+        }
+        
         .status-area {
             margin-top: 25px;
             text-align: left;
             padding: 20px;
             background: rgba(0, 0, 0, 0.15);
             border-radius: 10px;
-            min-height: 150px;
-            max-height: 300px;
-            overflow-y: auto;
+            max-height: 300px; /* Limit height */
+            overflow-y: auto; /* Add scroll */
             border: 1px solid rgba(255, 255, 255, 0.1);
         }
         .status-area h3 {
@@ -167,32 +190,12 @@ HTML_CLIENT = """
             opacity: 0.85;
             word-wrap: break-word;
             line-height: 1.4;
+            padding-right: 5px; /* Space for potential scrollbar */
         }
         .status-log .log-user { color: #a6c1ee; font-weight: 500; }
         .status-log .log-ai { color: #fbc2eb; font-weight: 500; }
         .status-log .log-system { color: #84fab0; font-weight: 500; }
-        
-        /* Status Indicator */
-        .status-indicator {
-            display: inline-block;
-            width: 12px;
-            height: 12px;
-            border-radius: 50%;
-            margin-right: 10px;
-            vertical-align: middle;
-            background-color: #ccc; /* Default */
-            animation: pulse 1.5s infinite ease-in-out;
-        }
-        .status-indicator.connected { background-color: #84fab0; animation-play-state: paused;}
-        .status-indicator.connecting { background-color: #fbc2eb; animation: pulse 1.5s infinite ease-in-out;}
-        .status-indicator.disconnected { background-color: #e74c3c; animation: pulse 1.5s infinite ease-in-out; animation-play-state: paused;}
-        .status-indicator.speaking { background-color: #8fd3f4; animation: pulse 1.5s infinite ease-in-out;}
-
-        @keyframes pulse {
-            0% { transform: scale(1); opacity: 1; }
-            50% { transform: scale(1.2); opacity: 0.7; }
-            100% { transform: scale(1); opacity: 1; }
-        }
+        .status-log .log-ai-thinking { color: #fbc2eb; font-weight: 500; opacity: 0.7;}
 
         @media (max-width: 600px) {
             .container { padding: 30px; }
@@ -232,8 +235,6 @@ HTML_CLIENT = """
     const statusIndicator = document.getElementById('statusIndicator');
     const statusLog = document.getElementById('statusLog');
 
-    let isUserSpeaking = false; // Client-side flag for speaking state
-
     function updateStatus(text, indicatorClass) {
         statusText.textContent = text;
         statusIndicator.className = `status-indicator ${indicatorClass}`;
@@ -253,35 +254,30 @@ HTML_CLIENT = """
         updateStatus('Connecting...', 'connecting');
         
         try {
-            // Ensure AudioContext is created and resumed
             const audioContext = new (window.AudioContext || window.webkitAudioContext)();
             if (audioContext.state === 'suspended') {
                 await audioContext.resume();
                 logMessage('AudioContext resumed.', 'system');
             }
 
-            // Get microphone stream
             localStream = await navigator.mediaDevices.getUserMedia({
                 audio: {
                     echoCancellation: true,
                     noiseSuppression: true,
-                    channelCount: 1, // Mono audio is often sufficient and more efficient
-                    sampleRate: 16000 // Request 16kHz directly if possible
+                    channelCount: 1, 
+                    sampleRate: 16000 
                 }
             });
             logMessage('Microphone access granted.', 'system');
 
-            // Setup PeerConnection
             pc = new RTCPeerConnection({
                 iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
             });
             logMessage('RTCPeerConnection created.', 'system');
 
-            // Add local audio track
             localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
             logMessage('Local audio track added.', 'system');
 
-            // Event handlers
             pc.ontrack = (event) => {
                 logMessage('Remote audio track received.', 'system');
                 if (event.streams && event.streams[0]) {
@@ -289,17 +285,15 @@ HTML_CLIENT = """
                     remoteAudio.play().then(() => {
                         logMessage('AI is speaking...', 'ai');
                         updateStatus('AI is speaking...', 'speaking');
-                        isUserSpeaking = false; // Ensure user speaking flag is reset
                     }).catch(error => {
                         logMessage(`Autoplay failed: ${error.message}`, 'system');
-                        updateStatus('Playback error, check console.', 'disconnected');
+                        updateStatus('Playback error', 'disconnected');
                     });
                     
                     remoteAudio.onended = () => {
                         if (pc.connectionState === 'connected') {
                             logMessage('AI finished speaking.', 'system');
                             updateStatus('Listening...', 'connected');
-                            isUserSpeaking = false;
                         }
                     };
                 } else {
@@ -310,8 +304,6 @@ HTML_CLIENT = """
             pc.onicecandidate = (event) => {
                 if (event.candidate && ws && ws.readyState === WebSocket.OPEN) {
                     ws.send(JSON.stringify({ type: 'ice-candidate', candidate: event.candidate.toJSON() }));
-                    // Optionally log ICE candidates if debugging is needed
-                    // logMessage(`Sent ICE candidate: ${event.candidate.type}`, 'system');
                 }
             };
             
@@ -326,11 +318,10 @@ HTML_CLIENT = """
                     logMessage('Connection established successfully!', 'system');
                 } else if (state === 'failed' || state === 'closed' || state === 'disconnected') {
                     logMessage(`Connection lost: ${state}`, 'system');
-                    stop(); // Ensure cleanup
+                    stop(); 
                 }
             };
 
-            // WebSocket setup
             const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
             ws = new WebSocket(`${protocol}//${location.host}/ws`);
             logMessage('WebSocket connecting...', 'system');
@@ -359,19 +350,11 @@ HTML_CLIENT = """
                         logMessage(`Error setting remote description: ${error.message}`, 'system');
                         stop();
                     }
-                } else if (data.type === 'ice-candidate') {
-                    // This is typically handled by the server sending candidates *after* the offer/answer
-                    // If the server sends candidates during signaling, we'd need to process them here.
-                    // For now, we assume the server handles sending its own ICE candidates.
                 } else if (data.type === 'transcription') {
-                    const { text, type } = data;
-                    if (type === 'user') {
-                        logMessage(`You: ${text}`, 'user');
-                        updateStatus('Listening...', 'connected'); // Reset status if user input is processed
-                        isUserSpeaking = false; // Reset user speaking flag
-                    } else if (type === 'ai_thinking') {
-                        logMessage(`AI is thinking...`, 'ai');
-                        updateStatus('AI Processing...', 'connecting');
+                    const { text, subtype } = data; // Use subtype for logging
+                    logMessage(text, subtype); // Log with appropriate class (user, ai, system, ai_thinking)
+                    if (subtype === 'user' || subtype === 'ai_thinking') {
+                         updateStatus('Listening...', 'connected'); // Reset status if user spoke or AI is thinking
                     }
                 }
             };
@@ -419,19 +402,6 @@ HTML_CLIENT = """
         stopBtn.disabled = true;
         logMessage('Connection closed.', 'system');
     }
-
-    // Optional: Handle browser visibility change to pause/resume audio if needed
-    document.addEventListener('visibilitychange', () => {
-        if (document.hidden) {
-            if (remoteAudio.srcObject && !remoteAudio.paused) {
-                remoteAudio.pause();
-            }
-        } else {
-            if (remoteAudio.srcObject && remoteAudio.paused) {
-                remoteAudio.play().catch(e => logMessage(`Resume autoplay failed: ${e.message}`, 'system'));
-            }
-        }
-    });
 </script>
 </body>
 </html>
@@ -472,27 +442,21 @@ class SileroVAD:
         self.get_speech_timestamps = None
         try:
             logger.info("🎤 Loading Silero VAD model...")
-            # Consider using ONNX export for potentially faster VAD inference
-            # self.model, utils = torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad', force_reload=False, onnx=True) # Example with ONNX
+            # Using PyTorch version. ONNX might be faster but requires export.
             self.model, utils = torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad', force_reload=False, onnx=False)
             self.get_speech_timestamps, _, _, _, _ = utils
             logger.info("✅ Silero VAD loaded successfully")
         except Exception as e:
             logger.error(f"❌ Error loading Silero VAD: {e}", exc_info=True)
-            # Fallback: If VAD fails, we might process audio continuously, or implement a simpler energy-based detection.
-            # For now, let's assume no VAD if it fails, meaning continuous processing.
-            self.model = None # Ensure model is None if loading failed
+            # Model remains None if loading fails
 
-    def detect_speech(self, audio_tensor, sample_rate=16000):
+    def detect_speech(self, audio_tensor, sample_rate=16000) -> bool:
         """Detects speech in an audio tensor."""
         if self.model is None: 
-            # Fallback behavior if VAD model failed to load. 
-            # This might increase latency as we process silence.
-            # Consider a basic energy-based check here if VAD is critical and fails.
-            # For simplicity, let's assume speech if VAD isn't available.
+            # Fallback: If VAD failed to load, assume speech is present to avoid blocking.
+            # This will increase latency as silence is processed.
             return True 
         try:
-            # Ensure audio is a PyTorch tensor
             if isinstance(audio_tensor, np.ndarray):
                 audio_tensor = torch.from_numpy(audio_tensor).float()
             
@@ -500,18 +464,17 @@ class SileroVAD:
             if audio_tensor.abs().max() < 0.005: 
                 return False
 
-            # Run VAD
-            # The get_speech_timestamps function expects a tensor of shape (num_samples,)
-            speech_timestamps = self.get_speech_timestamps(audio_tensor, self.model, sampling_rate=sample_rate, min_speech_duration_ms=150) # Reduced min duration for lower latency
+            # Run VAD. `get_speech_timestamps` expects shape (num_samples,)
+            # Reduced min_speech_duration_ms for lower latency detection
+            speech_timestamps = self.get_speech_timestamps(audio_tensor, self.model, sampling_rate=sample_rate, min_speech_duration_ms=150) 
             return len(speech_timestamps) > 0
         except Exception as e:
             logger.error(f"VAD detection error: {e}", exc_info=True)
-            return True # Assume speech on error to avoid interrupting flow
-
+            return True # Assume speech on error
 
 def initialize_models():
-    """Loads all AI models."""
-    global uv_pipe, tts_model # global uv_session, tts_session, uv_session_options, tts_session_options
+    """Loads all AI models. Returns False if critical models fail."""
+    global uv_pipe, tts_model, vad_model
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info(f"🚀 Initializing models on device: {device}")
@@ -519,20 +482,13 @@ def initialize_models():
     # --- Initialize VAD ---
     vad_model = SileroVAD()
     if vad_model.model is None:
-        logger.warning("Silero VAD model failed to load. Processing might be less efficient.")
-        # Decide how to handle this: exit, or proceed with a fallback.
-        # For now, we proceed but VAD might not work as expected.
+        logger.error("Silero VAD model failed to load. The system may not function correctly without VAD.")
+        # Critical failure - return False to prevent server startup
+        return False
 
     # --- Initialize Ultravox (STT + NLU/Generation) ---
     try:
         logger.info("📥 Loading Ultravox pipeline...")
-        # For ONNX Runtime Optimization:
-        # uv_ort_session_options = ort.SessionOptions()
-        # uv_ort_session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        # uv_session = ort.InferenceSession("path/to/your/ultravox.onnx", uv_ort_session_options, providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
-        # uv_processor = AutoProcessor.from_pretrained("fixie-ai/ultravox-v0_4", trust_remote_code=True) # Need processor for tokenization etc.
-        
-        # Using Hugging Face pipeline (convenient but less performant than ONNX/TRT)
         uv_pipe = pipeline(
             model="fixie-ai/ultravox-v0_4", 
             trust_remote_code=True, 
@@ -542,25 +498,20 @@ def initialize_models():
         logger.info("✅ Ultravox pipeline loaded successfully")
     except Exception as e:
         logger.error(f"❌ Failed to load Ultravox pipeline: {e}", exc_info=True)
-        return False
+        return False # Critical failure
 
     # --- Initialize Chatterbox TTS ---
     try:
         logger.info("📥 Loading Chatterbox TTS...")
-        # For ONNX Runtime Optimization:
-        # tts_ort_session_options = ort.SessionOptions()
-        # tts_ort_session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        # tts_session = ort.InferenceSession("path/to/your/tts_model.onnx", tts_ort_session_options, providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
-        
+        # Check ChatterboxTTS documentation for performance tuning options or alternative models.
         tts_model = ChatterboxTTS.from_pretrained(device=device)
         logger.info("✅ Chatterbox TTS loaded successfully")
     except Exception as e:
         logger.error(f"❌ Failed to load Chatterbox TTS: {e}", exc_info=True)
-        return False
+        return False # Critical failure
 
     logger.info("🎉 All models loaded successfully!")
     return True
-
 
 # --- Audio Processing Classes ---
 
@@ -572,7 +523,6 @@ class AudioBuffer:
         self.buffer = collections.deque(maxlen=self.max_samples)
         
         # Parameters for processing trigger
-        # Lower these to make the system more reactive, but could increase false positives.
         self.min_processing_samples = int(0.3 * sample_rate) # Minimum samples before considering VAD
         self.process_interval = 0.2  # Minimum time between VAD checks (seconds)
         self.last_process_check_time = time.time()
@@ -586,8 +536,7 @@ class AudioBuffer:
             if np.abs(audio_data).max() > 1.1: # Heuristic for PCM data
                  audio_data /= 32768.0
         
-        # Clamp values just in case
-        audio_data = np.clip(audio_data, -1.0, 1.0)
+        audio_data = np.clip(audio_data, -1.0, 1.0) # Clamp values
         self.buffer.extend(audio_data.flatten())
 
     def get_audio_chunk_for_processing(self) -> np.ndarray:
@@ -600,35 +549,36 @@ class AudioBuffer:
         Triggers if:
         1. Enough time has passed since the last check.
         2. The buffer contains at least `min_processing_samples`.
-        3. VAD detects speech in the current buffer.
+        3. VAD detects speech (if available).
         """
         current_time = time.time()
         
-        # Check time interval first
         if (current_time - self.last_process_check_time) < self.process_interval:
             return False
         
-        # Check buffer size
         if len(self.buffer) < self.min_processing_samples:
             return False
             
-        # Check if audio is essentially silent
         audio_chunk = self.get_audio_chunk_for_processing()
         if np.abs(audio_chunk).max() < 0.005: # Threshold for silence
-            self.last_process_check_time = current_time # Reset timer even if silent, to allow future checks
+            self.last_process_check_time = current_time # Reset timer even if silent
             return False
 
-        # Perform VAD detection
-        if vad_model.detect_speech(audio_chunk, self.sample_rate):
-            self.last_process_check_time = current_time # Update timer only if speech is detected or buffer is processed
-            return True
+        # Check VAD ONLY if the model is loaded
+        if vad_model and vad_model.model:
+            if vad_model.detect_speech(audio_chunk, self.sample_rate):
+                self.last_process_check_time = current_time # Update timer if speech detected
+                return True
+            else:
+                # If VAD detected silence, reset timer but don't process
+                # This helps avoid issues if VAD is overly sensitive
+                self.last_process_check_time = current_time 
+                return False
         else:
-            # If VAD says no speech, but we are beyond the min buffer size and time interval,
-            # we should still reset the timer to avoid getting stuck.
-            # However, if VAD is very sensitive, this might cause issues.
-            # For now, let's only reset if we actually process or if it's clearly silent.
-            # self.last_process_check_time = current_time # Optional: reset timer even if VAD false negative
-            return False
+            # Fallback: If VAD is not available, process based on buffer size and time
+            logger.warning("VAD model not available, processing audio based on buffer size and time.")
+            self.last_process_check_time = current_time # Update timer as we are processing
+            return True
 
     def reset(self):
         """Clears the audio buffer."""
@@ -640,7 +590,7 @@ class ResponseAudioTrack(MediaStreamTrack):
 
     def __init__(self):
         super().__init__()
-        self._queue = asyncio.Queue(maxsize=100) # Limit queue size to prevent memory buildup
+        self._queue = asyncio.Queue(maxsize=100) # Limit queue size
         self._current_chunk = None
         self._chunk_pos = 0
         self._timestamp = 0
@@ -650,7 +600,6 @@ class ResponseAudioTrack(MediaStreamTrack):
     async def queue_audio(self, audio_float32: np.ndarray):
         """Adds synthesized audio (float32) to the queue, converting to int16."""
         if audio_float32.size > 0:
-            # Convert float32 [-1.0, 1.0] to int16 [-32767, 32767]
             int16_audio = (np.clip(audio_float32, -1.0, 1.0) * 32767).astype(np.int16)
             await self._queue.put(int16_audio)
 
@@ -658,24 +607,19 @@ class ResponseAudioTrack(MediaStreamTrack):
         """Provides the next audio frame for WebRTC."""
         frame = np.zeros(self._frame_samples, dtype=np.int16)
         
-        # Load next chunk if current one is exhausted
         if self._current_chunk is None or self._chunk_pos >= len(self._current_chunk):
             try:
-                # Wait for a chunk, with a small timeout to prevent blocking indefinitely
                 self._current_chunk = await asyncio.wait_for(self._queue.get(), timeout=0.05)
                 self._chunk_pos = 0
             except asyncio.TimeoutError:
-                # If queue is empty, return silence (already initialized frame)
-                pass 
+                pass # Return silence if queue is empty
         
-        # Copy data from the current chunk to the frame buffer
         if self._current_chunk is not None:
             end_pos = min(self._chunk_pos + self._frame_samples, len(self._current_chunk))
             data_to_copy = self._current_chunk[self._chunk_pos:end_pos]
             frame[:len(data_to_copy)] = data_to_copy
             self._chunk_pos += len(data_to_copy)
         
-        # Create and return the AVFrame
         audio_frame = av.AudioFrame.from_ndarray(frame.reshape(1, -1), format="s16", layout="mono")
         audio_frame.pts = self._timestamp
         audio_frame.sample_rate = 48000
@@ -729,42 +673,43 @@ class AudioProcessor:
         """Main loop for receiving, buffering, and processing audio."""
         try:
             while True:
-                # If AI is speaking, discard incoming audio frames to prevent echo/feedback loops
+                # --- Handle AI Speaking State ---
                 if self.is_ai_speaking:
                     try:
-                        # Consume frames without processing them
+                        # Consume incoming audio frames without processing to prevent echo
                         await asyncio.wait_for(self.input_track.recv(), timeout=0.01)
-                        # Small sleep to yield control, important if no audio comes in
-                        await asyncio.sleep(0.005) 
-                    except asyncio.TimeoutError: 
-                        pass # No audio frame received, continue loop
+                        await asyncio.sleep(0.005) # Yield control
+                    except asyncio.TimeoutError: pass # No audio frame received
                     except mediastreams.MediaStreamError:
                         logger.warning("Input stream ended while AI was speaking.")
                         break # Exit loop if stream closes
-                    continue # Skip processing logic below
+                    continue # Skip rest of loop iteration
 
-                # Receive audio frame from the client
+                # --- Process Incoming Audio Frame ---
                 try:
                     frame = await self.input_track.recv()
                     audio_data = frame.to_ndarray().flatten().astype(np.float32) / 32768.0
                     
-                    # Resample to 16kHz for models
+                    resampled_audio = audio_data
                     if frame.sample_rate != 16000:
                         resampled_audio = librosa.resample(audio_data, orig_sr=frame.sample_rate, target_sr=16000)
-                    else:
-                        resampled_audio = audio_data
                     
                     self.audio_buffer.add_audio(resampled_audio)
                     self.last_user_audio_time = time.time() # Update last processed time
 
-                    # Check if audio buffer is ready for processing
+                    # --- Check if Buffer is Ready for Processing ---
                     if self.audio_buffer.should_process():
                         audio_to_process = self.audio_buffer.get_audio_chunk_for_processing()
                         self.audio_buffer.reset() # Clear buffer after getting data
                         
-                        # Send transcription to client
-                        await send_transcription_to_client(parse_ultravox_response(await self._run_inference(audio_to_process)), 'user')
-                        
+                        # Run inference and send transcription
+                        # Use a separate async task for inference to not block the main loop
+                        # This task will handle sending transcription messages
+                        inference_task = asyncio.create_task(self._handle_inference_and_response(audio_to_process))
+                        # Optionally wait for the task if you need to sequence things tightly, 
+                        # but for responsiveness, letting it run concurrently is better.
+                        # await inference_task 
+
                 except mediastreams.MediaStreamError:
                     logger.warning("Input stream ended.")
                     break # Exit loop if client disconnects
@@ -772,21 +717,20 @@ class AudioProcessor:
                     logger.error(f"Error processing audio frame: {e}", exc_info=True)
                     self.audio_buffer.reset() # Clear buffer on error
 
-                # --- Logic to trigger AI response after silence ---
+                # --- Detect End of User Utterance and Trigger AI Response ---
                 # If AI is not speaking, and there's a gap in user audio, trigger response.
                 if not self.is_ai_speaking and (time.time() - self.last_user_audio_time > self.silence_timeout):
-                    # Ensure we don't trigger immediately if user stops speaking abruptly
                     if (time.time() - self.last_user_audio_time > self.min_response_delay):
-                        logger.info("Detected potential end of user utterance.")
-                        # Re-check buffer one last time to ensure we have something meaningful
+                        logger.info("Detected potential end of user utterance (silence detected).")
+                        # Re-check buffer one last time
                         if self.audio_buffer.get_audio_chunk_for_processing().size > 0:
                             audio_to_process = self.audio_buffer.get_audio_chunk_for_processing()
                             self.audio_buffer.reset()
-                            # Send transcription and trigger AI response
-                            await send_transcription_to_client(parse_ultravox_response(await self._run_inference(audio_to_process)), 'user')
-                        # Reset buffer and last processed time after potential trigger
-                        self.audio_buffer.reset() 
-                        self.last_user_audio_time = time.time() # Reset timer to avoid rapid re-triggering
+                            # Trigger inference and response
+                            asyncio.create_task(self._handle_inference_and_response(audio_to_process))
+                        else:
+                            # If buffer is empty after silence, reset timer to avoid rapid re-triggering
+                            self.last_user_audio_time = time.time() 
                         
         except asyncio.CancelledError:
             logger.info("Audio processing loop cancelled.")
@@ -795,36 +739,58 @@ class AudioProcessor:
         finally:
             logger.info("Audio processor loop finished.")
 
-    async def _run_inference(self, audio_chunk: np.ndarray) -> str:
+    async def _handle_inference_and_response(self, audio_chunk: np.ndarray):
+        """ Orchestrates inference, transcription sending, and TTS response. """
+        if not audio_chunk.size > 0:
+            logger.warning("Received empty audio chunk for inference.")
+            return
+
+        # Send transcription message for the processed audio chunk
+        # This is the STT output
+        # For now, we are sending the raw audio chunk to the pipeline directly.
+        # A real implementation might require passing the actual transcribed text here.
+        # For demonstration, we'll assume the pipeline returns text we can log.
+        # TODO: Extract actual transcription from pipeline output if possible for better logging.
+        
+        # Run inference (STT + NLU/Generation)
+        response_text = await self._run_ultravox_inference(audio_chunk)
+        
+        if response_text:
+            # Send the transcribed text (or acknowledge processing) to the client
+            # This tells the client what was understood
+            await send_transcription_to_client(f"You: {response_text}", 'user') # Mark as user input for logging clarity
+            
+            # Generate TTS response
+            await self._synthesize_and_send_response(response_text)
+        else:
+            logger.warning("Ultravox inference returned no response text.")
+            await send_transcription_to_client("AI could not understand.", 'ai') # Inform user
+
+    async def _run_ultravox_inference(self, audio_chunk: np.ndarray) -> str:
         """Runs the Ultravox pipeline (STT + NLU/Generation)."""
         logger.info(f"Running inference on {len(audio_chunk)} samples...")
+        # Inform client that AI is processing
         await send_transcription_to_client("AI is thinking...", 'ai_thinking')
         
         # --- Run Inference ---
         # FOR ONNX/TENSORRT: Replace this section with calls to your exported model sessions.
-        # Example for ONNX Runtime:
-        # input_name = uv_session.get_inputs()[0].name
-        # output_name = uv_session.get_outputs()[0].name
-        # # Preprocess audio_chunk if needed for the ONNX model (e.g., spectrogram)
-        # # This part is model-specific. Assuming raw audio input for now.
-        # # Note: Many STT models require specific preprocessing like Mel spectrograms.
-        # # You'll need to replicate the `transformers` pipeline's preprocessing.
-        # # For simplicity, let's assume the pipeline handles it directly.
+        # Example:
+        # try:
+        #     # Preprocess audio_chunk (e.g., Mel Spectrogram)
+        #     # preprocessed_input = preprocess_audio(audio_chunk, ...) 
+        #     # Run ONNX session
+        #     # output = uv_session.run(None, {input_name: preprocessed_input})
+        #     # response_text = postprocess_onnx_output(output)
+        # except Exception as e:
+        #     logger.error(f"Error during ONNX inference: {e}", exc_info=True)
+        #     return ""
         
         # Default pipeline inference:
         try:
             with torch.inference_mode(): # Crucial for performance
-                # The 'pipeline' expects a dictionary, and the model might have specific input names.
-                # Check the model card for exact expected input format. Common formats:
-                # {'text': '...', 'sampling_rate': 16000} for text models
-                # {'audio': np.array(...), 'sampling_rate': 16000} for speech models
-                
-                # Assuming Ultravox accepts raw audio directly as input
-                # IMPORTANT: Check if 'fixie-ai/ultravox-v0_4' needs specific preprocessing (e.g., Mel Spectrogram).
-                # If it does, you'll need to add that preprocessing step here before passing to the pipeline or your ONNX session.
-                
-                # Example for models expecting audio input:
-                result = uv_pipe(audio_chunk, sampling_rate=16000, max_new_tokens=50) # Adjust max_new_tokens as needed
+                # The 'pipeline' expects a dictionary. Check model card for exact input names.
+                # Assuming it accepts raw audio directly. Needs verification!
+                result = uv_pipe(audio_chunk, sampling_rate=16000, max_new_tokens=50) 
                 
             response_text = parse_ultravox_response(result)
             logger.info(f"Ultravox generated: '{response_text}'")
@@ -832,7 +798,7 @@ class AudioProcessor:
 
         except Exception as e:
             logger.error(f"Error during Ultravox inference: {e}", exc_info=True)
-            return "" # Return empty string on error
+            return "" 
 
     def _run_tts_sync(self, text: str) -> np.ndarray:
         """Synchronous TTS generation, intended for executor."""
@@ -842,18 +808,16 @@ class AudioProcessor:
         try:
             # FOR ONNX/TENSORRT: Replace with your TTS model session inference.
             # Example:
-            # input_name = tts_session.get_inputs()[0].name # Text input
-            # output_name = tts_session.get_outputs()[0].name # Audio output
-            # # Need to tokenize text if the model expects token IDs
-            # # output_audio_np = tts_session.run([output_name], {input_name: tokenized_text})[0]
-            # # Resample output_audio_np if necessary
-            
+            # tokenized_text = preprocess_text(text, ...)
+            # audio_output_np = tts_session.run(None, {'input_ids': tokenized_text})[0]
+            # audio_output_np = postprocess_tts_output(audio_output_np) # Resample, etc.
+            # return audio_output_np
+
             # Default ChatterboxTTS inference
             with torch.inference_mode():
                 wav = tts_model.generate(text).cpu().numpy().flatten()
             
-            # Resample TTS output to 48kHz for WebRTC if needed (assuming ChatterboxTTS might output differently)
-            target_sr = 48000
+            target_sr = 48000 # WebRTC standard
             if tts_model.sampling_rate != target_sr:
                 logger.info(f"Resampling TTS output from {tts_model.sampling_rate}Hz to {target_sr}Hz.")
                 wav_resampled = librosa.resample(wav.astype(np.float32), orig_sr=tts_model.sampling_rate, target_sr=target_sr)
@@ -879,36 +843,30 @@ class AudioProcessor:
         if synthesized_audio.size > 0:
             # --- State Management for Speaking ---
             self.is_ai_speaking = True
-            logMessage(f'AI: {response_text}', 'ai')
-            updateStatus('AI is speaking...', 'speaking');
-
+            # Client UI status update handled by JS on 'speaking' event or explicit message
+            
             await self.output_track.queue_audio(synthesized_audio)
             
-            # Calculate playback duration and sleep
             playback_duration = synthesized_audio.size / 48000.0 # 48kHz
             await asyncio.sleep(playback_duration + 0.1) # Add a small buffer
             
             self.is_ai_speaking = False
-            # Status will be updated by the remoteAudio.onended handler in JS
-            # Or we can explicitly set it here:
-            if pc and pc.connectionState == 'connected':
-                 updateStatus('Listening...', 'connected');
+            # Client UI status update will be handled by JS remoteAudio.onended
+            # Or we can send an explicit message:
+            await send_transcription_to_client("AI finished speaking.", 'system')
             logger.info("AI finished speaking.")
         else:
             logger.warning("TTS generation resulted in empty audio.")
-            # If TTS fails, we should reset state so user can try again
-            self.is_ai_speaking = False
-            if pc and pc.connectionState == 'connected':
-                 updateStatus('Listening...', 'connected');
+            self.is_ai_speaking = False # Reset state on TTS failure
+            await send_transcription_to_client("AI could not generate speech.", 'system')
 
 
 # --- WebSocket Communication Handler ---
-ws_clients = set() # Keep track of active WebSocket connections
 
-async def send_transcription_to_client(text: str, type: str):
+async def send_transcription_to_client(text: str, subtype: str):
     """Sends transcription/status messages to all connected WebSocket clients."""
     if not text: return
-    message = json.dumps({"type": "transcription", "text": text, "subtype": type}) # subtype to differentiate user/AI/thinking
+    message = json.dumps({"type": "transcription", "text": text, "subtype": subtype})
     
     disconnected_sockets = set()
     for ws in ws_clients:
@@ -921,7 +879,6 @@ async def send_transcription_to_client(text: str, type: str):
             logger.error(f"Error sending message to WebSocket client: {e}", exc_info=True)
             disconnected_sockets.add(ws)
             
-    # Clean up closed sockets
     for ws in disconnected_sockets:
         ws_clients.discard(ws)
 
@@ -932,6 +889,7 @@ async def websocket_handler(request):
     ws_clients.add(ws)
     logger.info(f"WebSocket client connected: {ws}")
 
+    # Initialize PeerConnection for this connection
     pc = RTCPeerConnection(RTCConfiguration([RTCIceServer(urls="stun:stun.l.google.com:19302")]))
     pcs.add(pc)
     audio_processor = None
@@ -969,7 +927,7 @@ async def websocket_handler(request):
         async for msg in ws:
             if msg.type == WSMsgType.TEXT:
                 data = json.loads(msg.data)
-                logger.debug(f"Received WebSocket message: {data['type']}")
+                logger.debug(f"Received WebSocket message: {data.get('type', 'unknown')}")
                 
                 if data["type"] == "offer":
                     await pc.setRemoteDescription(RTCSessionDescription(sdp=data["sdp"], type=data["type"]))
@@ -984,7 +942,7 @@ async def websocket_handler(request):
                         candidate_string = candidate_data.get("candidate")
                         if candidate_string:
                             params = candidate_from_sdp(candidate_string)
-                            candidate = RTCIceCandidate(sdpMid=candidate_data.get("sdpMLineIndex"), sdpMLineIndex=candidate_data.get("sdpMLineIndex"), **params)
+                            candidate = RTCIceCandidate(sdpMid=candidate_data.get("sdpMid"), sdpMLineIndex=candidate_data.get("sdpMLineIndex"), **params)
                             await pc.addIceCandidate(candidate)
                             logger.debug(f"Added remote ICE candidate.")
                     except Exception as e:
@@ -1007,12 +965,16 @@ async def websocket_handler(request):
 
 async def cleanup_connection(pc, audio_processor, ws):
     """Helper function to clean up resources when a connection is lost."""
+    logger.info("Cleaning up connection resources...")
     if audio_processor:
         await audio_processor.stop()
+        audio_processor = None # Clear reference
+        
     if pc and pc.connectionState != "closed":
         await pc.close()
     if pc in pcs:
         pcs.remove(pc)
+        
     if ws and ws in ws_clients:
         ws_clients.discard(ws)
         if not ws.closed:
@@ -1028,19 +990,16 @@ async def index_handler(request):
 async def on_shutdown(app):
     """Gracefully shuts down all connections and resources."""
     logger.info("Shutting down server and closing connections...")
-    # Close all active PeerConnections
     for pc_conn in list(pcs):
         if pc_conn.connectionState != "closed":
             await pc_conn.close()
     pcs.clear()
     
-    # Close all active WebSockets
     for ws_conn in list(ws_clients):
         if not ws_conn.closed:
             await ws_conn.close(code=1001, message="Server shutting down")
     ws_clients.clear()
 
-    # Shut down the thread pool
     executor.shutdown(wait=True)
     logger.info("Executor shut down. Server stopped.")
 
