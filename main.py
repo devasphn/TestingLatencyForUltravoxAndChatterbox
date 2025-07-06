@@ -125,7 +125,7 @@ HTML_CLIENT = """
             ws.onopen = async () => {
                 const offer = await pc.createOffer();
                 await pc.setLocalDescription(offer);
-                ws.send(JSON.stringify(offer)); // Corrected typo from previous version
+                ws.send(JSON.stringify(offer)); 
             };
 
             ws.onmessage = async e => {
@@ -133,7 +133,6 @@ HTML_CLIENT = """
                 if (data.type === 'answer' && !pc.currentRemoteDescription) {
                     await pc.setRemoteDescription(new RTCSessionDescription(data));
                 }
-                // Handle ICE candidates sent from server if applicable
             };
 
             const closeHandler = () => { if (pc && pc.connectionState !== 'closed') stop(); };
@@ -195,7 +194,7 @@ class SileroVAD:
 
     def detect_speech(self, audio_tensor, sample_rate=16000):
         if self.model is None: 
-            return True # Fallback if VAD failed to load
+            return True 
         try:
             if isinstance(audio_tensor, np.ndarray): audio_tensor = torch.from_numpy(audio_tensor)
             if audio_tensor.abs().max() < 0.01: return False 
@@ -204,7 +203,7 @@ class SileroVAD:
             return len(speech_timestamps) > 0
         except Exception as e:
             logger.error(f"VAD detection error: {e}")
-            return True # Assume speech on error
+            return True
 
 def initialize_models():
     global uv_pipe, tts_model, vad_model
@@ -342,7 +341,7 @@ class AudioProcessor:
             pipeline_input = {
                 "audio": audio_array,
                 "sampling_rate": 16000,
-                "turns": [] 
+                "turns": [] # As indicated by the error traceback
             }
             
             with torch.inference_mode(): 
@@ -435,7 +434,7 @@ async def websocket_handler(request):
         logger.error(f"WebSocket handler error: {e}", exc_info=True)
         await cleanup_connection(pc, processor, ws)
     finally:
-        await cleanup_connection(pc, processor, ws) # Final cleanup
+        await cleanup_connection(pc, processor, ws)
     return ws
 
 async def cleanup_connection(pc, audio_processor, ws):
