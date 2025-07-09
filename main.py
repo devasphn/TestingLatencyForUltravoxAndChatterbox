@@ -15,7 +15,9 @@ from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack, R
 import av
 
 from transformers import pipeline
-from chatterbox.tts import ChatterboxTTS
+# Correct imports for the TTS model via the moshi library
+from moshi.models.loaders import CheckpointInfo
+from moshi.models.tts import TTSModel
 import torch.hub
 
 # --- Basic Setup ---
@@ -31,26 +33,13 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 logging.getLogger('aioice.ice').setLevel(logging.WARNING)
 logging.getLogger('aiortc').setLevel(logging.WARNING)
-logging.getLogger('websockets').setLevel(logging.WARNING)
-logging.getLogger('transformers.modeling_utils').setLevel(logging.ERROR) 
-logging.getLogger('transformers.pipelines.base').setLevel(logging.WARNING) # Suppress generic pipeline warnings if they appear
 
 # --- Global Variables & HTML ---
 uv_pipe, tts_model, vad_model = None, None, None
 executor = ThreadPoolExecutor(max_workers=4)
 pcs = set()
-ws_clients = set() 
 
-# --- System Prompt Definition ---
-# This prompt will guide the AI's behavior. We'll try to inject it.
-SYSTEM_PROMPT = (
-    "You are a helpful AI assistant. Respond ONLY in English. "
-    "Do not respond in French, Arabic, or any other language. "
-    "If you cannot understand the user's input, politely ask them to repeat or rephrase in English. "
-    "Keep your responses concise and directly address the user's query."
-)
-# --- End System Prompt Definition ---
-
+# [HTML_CLIENT remains the same...]
 HTML_CLIENT = """
 <!DOCTYPE html>
 <html>
@@ -65,9 +54,11 @@ HTML_CLIENT = """
         button:hover { transform: translateY(-2px); box-shadow: 0 4px 8px rgba(0,0,0,0.2); }
         button:disabled { background: #95a5a6; cursor: not-allowed; transform: none; box-shadow: none; }
         .stop-btn { background: #e74c3c; } .stop-btn:hover { background: #c0392b; }
-        .status { margin: 20px 0; padding: 15px; border-radius: 5px; font-weight: 500; transition: background-color 0.5s; }
-        .status.connected { background: #27ae60; } .status.disconnected { background: #c0392b; } .status.connecting { background: #f39c12; }
-        .status.speaking { background: #3498db; animation: pulse 2s infinite; }
+        .status { margin: 20px 0; padding: 15px; border-radius: 5px; font-weight: 500; transition: background-color 0.5s, box-shadow 0.3s; }
+        .status.connected { background: #27ae60; }
+        .status.disconnected { background: #c0392b; }
+        .status.connecting { background: #f39c12; }
+        .status.speaking { background: #3498db; animation: pulse 1.5s infinite; }
         @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(52, 152, 219, 0.7); } 70% { box-shadow: 0 0 0 10px rgba(52, 152, 219, 0); } 100% { box-shadow: 0 0 0 0 rgba(52, 152, 219, 0); } }
     </style>
 </head>
@@ -87,17 +78,16 @@ HTML_CLIENT = """
     const startBtn = document.getElementById('startBtn');
     const stopBtn = document.getElementById('stopBtn');
     const statusDiv = document.getElementById('status');
+    let isAISpeaking = false;
 
     function updateStatus(message, className) { statusDiv.textContent = message; statusDiv.className = `status ${className}`; }
 
     async function start() {
+        if(ws || pc) { stop(); }
         startBtn.disabled = true;
         updateStatus('🔄 Connecting...', 'connecting');
         try {
-            const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-            if (audioContext.state === 'suspended') { await audioContext.resume(); }
-
-            localStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+            localStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
             pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
             
             localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
@@ -108,24 +98,15 @@ HTML_CLIENT = """
                     remoteAudio.srcObject = e.streams[0];
                     remoteAudio.play().catch(err => console.error("Autoplay failed:", err));
                     
-                    remoteAudio.onplaying = () => {
-                        updateStatus('🤖 AI Speaking...', 'speaking');
-                    };
-                    remoteAudio.onended = () => {
-                         if(pc.connectionState === 'connected') updateStatus('✅ Listening...', 'connected');
-                    };
+                    remoteAudio.onplaying = () => { if(pc && pc.connectionState === 'connected') updateStatus('🤖 AI Speaking...', 'speaking'); };
+                    remoteAudio.onended = () => { if(pc && pc.connectionState === 'connected') updateStatus('✅ Listening...', 'connected'); };
                 }
             };
 
-            pc.onicecandidate = e => {
-                if (e.candidate && ws && ws.readyState === WebSocket.OPEN) {
-                    ws.send(JSON.stringify({ type: 'ice-candidate', candidate: e.candidate.toJSON() }));
-                }
-            };
+            pc.onicecandidate = e => { if (e.candidate && ws && ws.readyState === WebSocket.OPEN) { ws.send(JSON.stringify({ type: 'ice-candidate', candidate: e.candidate.toJSON() })); } };
             
             pc.onconnectionstatechange = () => {
                 const state = pc.connectionState;
-                console.log(`Connection state: ${state}`);
                 if (state === 'connecting') updateStatus('🤝 Establishing secure connection...', 'connecting');
                 else if (state === 'connected') { updateStatus('✅ Listening...', 'connected'); stopBtn.disabled = false; }
                 else if (state === 'failed' || state === 'closed' || state === 'disconnected') stop();
@@ -137,14 +118,12 @@ HTML_CLIENT = """
             ws.onopen = async () => {
                 const offer = await pc.createOffer();
                 await pc.setLocalDescription(offer);
-                ws.send(JSON.stringify(offer)); 
+                ws.send(JSON.stringify(offer));
             };
 
             ws.onmessage = async e => {
                 const data = JSON.parse(e.data);
-                if (data.type === 'answer' && !pc.currentRemoteDescription) {
-                    await pc.setRemoteDescription(new RTCSessionDescription(data));
-                }
+                if (data.type === 'answer' && !pc.currentRemoteDescription) { await pc.setRemoteDescription(new RTCSessionDescription(data)); }
             };
 
             const closeHandler = () => { if (pc && pc.connectionState !== 'closed') stop(); };
@@ -179,12 +158,24 @@ def candidate_from_sdp(candidate_string: str) -> dict:
     return params
 
 def parse_ultravox_response(result):
+    """Parse the Ultravox response with better error handling"""
     try:
-        if isinstance(result, str): return result
+        if isinstance(result, str): 
+            return result
         elif isinstance(result, list) and len(result) > 0:
             item = result[0]
-            if isinstance(item, str): return item
-            elif isinstance(item, dict) and 'generated_text' in item: return item['generated_text']
+            if isinstance(item, str): 
+                return item
+            elif isinstance(item, dict):
+                # Check multiple possible keys
+                for key in ['generated_text', 'text', 'content']:
+                    if key in item:
+                        return item[key]
+        elif isinstance(result, dict):
+            # Check for common response keys
+            for key in ['generated_text', 'text', 'content', 'response']:
+                if key in result:
+                    return result[key]
         return ""
     except Exception as e:
         logger.error(f"Error parsing Ultravox response: {e}")
@@ -193,8 +184,6 @@ def parse_ultravox_response(result):
 # --- Model Loading and VAD ---
 class SileroVAD:
     def __init__(self):
-        self.model = None 
-        self.get_speech_timestamps = None
         try:
             logger.info("🎤 Loading Silero VAD model...")
             self.model, utils = torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad', force_reload=False, onnx=False)
@@ -202,14 +191,13 @@ class SileroVAD:
             logger.info("✅ Silero VAD loaded successfully")
         except Exception as e:
             logger.error(f"❌ Error loading Silero VAD: {e}", exc_info=True)
+            self.model = None
 
     def detect_speech(self, audio_tensor, sample_rate=16000):
-        if self.model is None: 
-            return True 
+        if self.model is None: return True
         try:
             if isinstance(audio_tensor, np.ndarray): audio_tensor = torch.from_numpy(audio_tensor)
-            if audio_tensor.abs().max() < 0.01: return False 
-            
+            if audio_tensor.abs().max() < 0.01: return False
             speech_timestamps = self.get_speech_timestamps(audio_tensor, self.model, sampling_rate=sample_rate, min_speech_duration_ms=250)
             return len(speech_timestamps) > 0
         except Exception as e:
@@ -219,29 +207,21 @@ class SileroVAD:
 def initialize_models():
     global uv_pipe, tts_model, vad_model
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    logger.info(f"🚀 Initializing models on device: {device}")
+    torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    logger.info(f"🚀 Initializing models on device: {device} with dtype: {torch_dtype}")
     
     vad_model = SileroVAD()
-    if vad_model.model is None:
-        logger.error("Silero VAD model failed to load. Cannot proceed.")
-        return False
+    if not vad_model.model: return False
         
     try:
         logger.info("📥 Loading Ultravox pipeline...")
-        
-        # System prompt is defined globally, but we don't pass it here anymore
-        # as the pipeline doesn't seem to support it directly via arguments.
-        uv_pipe = pipeline(
-            model="fixie-ai/ultravox-v0_4", 
-            trust_remote_code=True, 
-            device_map="auto", 
-            torch_dtype=torch.float16
-        )
+        uv_pipe = pipeline(model="fixie-ai/ultravox-v0_4", trust_remote_code=True, device_map="auto", torch_dtype=torch_dtype)
         logger.info("✅ Ultravox pipeline loaded successfully")
 
-        logger.info("📥 Loading Chatterbox TTS...")
-        tts_model = ChatterboxTTS.from_pretrained(device=device)
-        logger.info("✅ Chatterbox TTS loaded successfully")
+        logger.info("📥 Loading Kyutai TTS model via Moshi (`kyutai/tts-1.6B-en_fr`)...")
+        checkpoint_info = CheckpointInfo.from_hf_repo('kyutai/tts-1.6B-en_fr')
+        tts_model = TTSModel.from_checkpoint_info(checkpoint_info, device=torch.device(device), dtype=torch_dtype)
+        logger.info("✅ Kyutai TTS loaded successfully")
         
         logger.info("🎉 All models loaded successfully!")
         return True
@@ -269,10 +249,7 @@ class AudioBuffer:
             self.last_process_time = current_time
             audio_array = self.get_audio_array()
             if np.abs(audio_array).max() < 0.005: return False
-            if vad_model and vad_model.model: 
-                 return vad_model.detect_speech(audio_array, self.sample_rate)
-            else:
-                 return True 
+            return vad_model.detect_speech(audio_array, self.sample_rate)
         return False
 
     def reset(self): self.buffer.clear()
@@ -289,11 +266,8 @@ class ResponseAudioTrack(MediaStreamTrack):
         frame = np.zeros(frame_samples, dtype=np.int16)
         
         if self._current_chunk is None or self._chunk_pos >= len(self._current_chunk):
-            try:
-                self._current_chunk = await asyncio.wait_for(self._queue.get(), timeout=0.01)
-                self._chunk_pos = 0
-            except asyncio.TimeoutError:
-                pass
+            try: self._current_chunk = await asyncio.wait_for(self._queue.get(), timeout=0.01); self._chunk_pos = 0
+            except asyncio.TimeoutError: pass
         
         if self._current_chunk is not None:
             end_pos = self._chunk_pos + frame_samples
@@ -312,7 +286,7 @@ class ResponseAudioTrack(MediaStreamTrack):
 class AudioProcessor:
     def __init__(self, output_track: ResponseAudioTrack, executor: ThreadPoolExecutor):
         self.track, self.buffer, self.output_track, self.task, self.executor = None, AudioBuffer(), output_track, None, executor
-        self.is_speaking = False 
+        self.is_speaking = False
 
     def add_track(self, track): self.track = track
     async def start(self): self.task = asyncio.create_task(self._run())
@@ -323,10 +297,8 @@ class AudioProcessor:
         try:
             while True:
                 if self.is_speaking:
-                    try:
-                        await asyncio.wait_for(self.track.recv(), timeout=0.01)
-                    except asyncio.TimeoutError:
-                        await asyncio.sleep(0.01) 
+                    try: await asyncio.wait_for(self.track.recv(), timeout=0.01)
+                    except asyncio.TimeoutError: await asyncio.sleep(0.01)
                     continue
 
                 try: frame = await self.track.recv()
@@ -345,80 +317,97 @@ class AudioProcessor:
         except Exception as e: logger.error(f"Audio processor error: {e}", exc_info=True)
         finally: logger.info("Audio processor stopped.")
             
-    def _blocking_tts(self, text: str) -> np.ndarray:
+    def _blocking_asr_llm_tts(self, audio_array) -> np.ndarray:
         try:
+            # 1. ASR + LLM (Ultravox) - CORRECTED INPUT FORMAT
             with torch.inference_mode():
-                wav = tts_model.generate(text).cpu().numpy().flatten()
-                return librosa.resample(wav.astype(np.float32), orig_sr=24000, target_sr=48000)
+                # Create proper turns structure for conversation context
+                turns = [
+                    {
+                        "role": "user",
+                        "content": "Please respond to what I just said."
+                    }
+                ]
+                
+                # FIXED: Correct input format for Ultravox pipeline
+                # All parameters should be inside the main dictionary
+                ultravox_input = {
+                    'audio': audio_array,
+                    'turns': turns,
+                    'sampling_rate': 16000  # This should be inside the main dict
+                }
+                
+                result = uv_pipe(ultravox_input, max_new_tokens=100)
+                
+            response_text = parse_ultravox_response(result).strip()
+            if not response_text: 
+                logger.warning("No response from Ultravox model")
+                return np.array([], dtype=np.float32)
+            
+            logger.info(f"AI Response: '{response_text}'")
+            
+            # 2. TTS (Kyutai/Moshi) - CORRECTED TTS CODE
+            with torch.inference_mode():
+                try:
+                    # a. Prepare the text script. This returns a LIST of 'Entry' objects.
+                    entries = tts_model.prepare_script([response_text])
+                    
+                    # b. Get a reference voice for conditioning.
+                    voice_path_str = "expresso/ex03-ex01_happy_001_channel1_334s.wav"
+                    voice_path = tts_model.get_voice_path(voice_path_str)
+                    
+                    # c. Create the condition_attributes. The function returns a SINGLE object.
+                    # We need to wrap it in a list for the generate function.
+                    condition_attributes = [tts_model.make_condition_attributes([voice_path])]
+                    
+                    # d. Generate audio - FIXED: Pass entries as a list
+                    results_list = tts_model.generate([entries], condition_attributes)
+                    
+                    # e. The generate function returns a LIST of TTSResult objects.
+                    # Get the first result from the list.
+                    result = results_list[0]
+                    
+                    # f. Get the audio data and sample rate from its attributes.
+                    wav = result.wav
+                    sr = result.sample_rate
+                    
+                    # Resample to 48kHz for WebRTC output
+                    return librosa.resample(wav.astype(np.float32), orig_sr=sr, target_sr=48000)
+                    
+                except Exception as tts_error:
+                    logger.error(f"TTS generation failed: {tts_error}", exc_info=True)
+                    return np.array([], dtype=np.float32)
+                    
         except Exception as e:
-            logger.error(f"TTS generation failed in background thread: {e}", exc_info=True)
+            logger.error(f"ASR/LLM/TTS pipeline failed: {e}", exc_info=True)
             return np.array([], dtype=np.float32)
 
     async def process_speech(self, audio_array):
         try:
-            # --- REVISED INPUT FORMATTING ---
-            # Based on research, pipelines often expect audio directly or within a specific key.
-            # Let's try passing audio directly and handle system prompt potentially via pipeline arguments or a different structure.
-            # Since direct 'system_prompt' arg failed, and 'turns' caused errors, 
-            # let's try passing audio as the main input, and system prompt prepended to the text output if needed later.
-            
-            # NOTE: The system prompt is NOT passed directly here as it caused errors.
-            # We'll rely on the model's default behavior or potentially inject it differently if needed.
-            
-            with torch.inference_mode(): 
-                # Pass audio_array directly as the primary input to the pipeline.
-                # Use keyword arguments for metadata like sampling_rate.
-                result = uv_pipe(
-                    audio_array,  # Pass the raw audio array
-                    sampling_rate=16000, 
-                    max_new_tokens=50
-                ) 
-            
-            response_text = parse_ultravox_response(result).strip()
-            if not response_text: 
-                logger.warning("Ultravox returned empty response.")
-                return # Exit if no text is generated
-
-            # --- System Prompt Application (Heuristic) ---
-            # Since direct injection failed, we'll try to *prepend* the system prompt 
-            # to the AI's response *after* it's generated, hoping it guides subsequent turns.
-            # This is a weak heuristic but might help slightly.
-            # A better solution would require modifying the pipeline or using a model that supports it.
-            final_response_text = f"{SYSTEM_PROMPT}\n\nUser said: {audio_array}\n\nAI responded: {response_text}"
-            # For logging purposes, we'll use the original response_text to avoid confusing the user logs.
-            logger.info(f"AI Response (raw): '{response_text}'")
+            self.is_speaking = True
+            logger.info("🤖 AI is speaking...")
             
             loop = asyncio.get_running_loop()
-            resampled_wav = await loop.run_in_executor(self.executor, self._blocking_tts, response_text) # Use original response for TTS
+            resampled_wav = await loop.run_in_executor(self.executor, self._blocking_asr_llm_tts, audio_array)
 
             if resampled_wav.size > 0:
-                # --- ECHO CANCELLATION LOGIC ---
-                self.is_speaking = True
-                logger.info("🤖 AI is speaking...")
-                
                 await self.output_track.queue_audio(resampled_wav)
-
                 playback_duration = resampled_wav.size / 48000
-                await asyncio.sleep(playback_duration + 0.1)  
+                await asyncio.sleep(playback_duration + 0.1)
+            else:
+                logger.warning("No audio generated from TTS")
 
-                self.is_speaking = False
-                logger.info("✅ AI finished speaking, now listening.")
-
-        except ValueError as ve:
-            # Catch specific errors like the placeholder issue
-            logger.error(f"ValueError during speech processing: {ve}. Input format might be incorrect for the pipeline.")
-            await send_transcription_to_client("AI Error: Could not process audio input.", 'system')
-            self.is_speaking = False 
         except Exception as e:
             logger.error(f"Speech processing error: {e}", exc_info=True)
-            self.is_speaking = False 
-
+        finally:
+            self.is_speaking = False
+            self.buffer.reset() # Hard reset to clear echo
+            logger.info("✅ AI finished speaking, now listening.")
 
 # --- WebRTC and WebSocket Handling ---
 async def websocket_handler(request):
     ws = web.WebSocketResponse(heartbeat=30)
     await ws.prepare(request)
-    ws_clients.add(ws) 
     
     pc = RTCPeerConnection(RTCConfiguration([RTCIceServer(urls="stun:stun.l.google.com:19302")]))
     pcs.add(pc)
@@ -439,7 +428,8 @@ async def websocket_handler(request):
     async def on_connectionstatechange():
         logger.info(f"ICE Connection State is {pc.connectionState}")
         if pc.connectionState in ["failed", "closed", "disconnected"]:
-            await cleanup_connection(pc, processor, ws) 
+            if pc in pcs: pcs.remove(pc)
+            await pc.close()
 
     try:
         async for msg in ws:
@@ -455,44 +445,19 @@ async def websocket_handler(request):
                         candidate_data = data["candidate"]
                         candidate_string = candidate_data.get("candidate")
                         if candidate_string:
-                            if pc.remoteDescription: 
-                                params = candidate_from_sdp(candidate_string)
-                                candidate = RTCIceCandidate(sdpMid=candidate_data.get("sdpMid"), sdpMLineIndex=candidate_data.get("sdpMLineIndex"), **params)
-                                await pc.addIceCandidate(candidate)
-                            else:
-                                logger.warning("Received ICE candidate before remote description was set. Ignoring.")
+                            params = candidate_from_sdp(candidate_string)
+                            candidate = RTCIceCandidate(sdpMid=candidate_data.get("sdpMid"), sdpMLineIndex=candidate_data.get("sdpMLineIndex"), **params)
+                            await pc.addIceCandidate(candidate)
                     except Exception as e:
                         logger.error(f"Error adding ICE candidate: {e}", exc_info=True)
-            elif msg.type == WSMsgType.ERROR:
-                logger.error(f"WebSocket error: {ws.exception()}")
-                await cleanup_connection(pc, processor, ws)
-            elif msg.type == WSMsgType.CLOSE:
-                logger.info("WebSocket closed by client.")
-                await cleanup_connection(pc, processor, ws)
-
     except Exception as e:
         logger.error(f"WebSocket handler error: {e}", exc_info=True)
-        await cleanup_connection(pc, processor, ws)
     finally:
-        await cleanup_connection(pc, processor, ws)
+        logger.info("WebSocket connection closed.")
+        if processor: await processor.stop()
+        if pc in pcs: pcs.remove(pc)
+        if pc.connectionState != "closed": await pc.close()
     return ws
-
-async def cleanup_connection(pc, audio_processor, ws):
-    logger.info("Cleaning up connection resources...")
-    if audio_processor:
-        await audio_processor.stop()
-        audio_processor = None
-        
-    if pc and pc.connectionState != "closed":
-        await pc.close()
-    if pc in pcs:
-        pcs.remove(pc)
-        
-    if ws and ws in ws_clients: 
-        ws_clients.discard(ws)
-        if not ws.closed:
-             await ws.close()
-    logger.info("Connection resources cleaned up.")
 
 async def index_handler(request):
     return web.Response(text=HTML_CLIENT, content_type='text/html')
@@ -500,16 +465,8 @@ async def index_handler(request):
 # --- Main Application Logic ---
 async def on_shutdown(app):
     logger.info("Shutting down server...")
-    for pc_conn in list(pcs): 
-        if pc_conn.connectionState != "closed":
-            await pc_conn.close()
+    for pc_conn in list(pcs): await pc_conn.close()
     pcs.clear()
-    
-    for ws_conn in list(ws_clients): 
-        if not ws_conn.closed:
-            await ws.close(code=1001, message="Server shutting down") # Use ws, not ws_conn
-    ws_clients.clear()
-
     executor.shutdown(wait=True)
     logger.info("Shutdown complete.")
 
@@ -526,18 +483,13 @@ async def main():
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', 7860)
+    await site.start()
     
-    try:
-        await site.start()
-        print("✅ Server started successfully on http://0.0.0.0:7860")
-        print("🚀 Your speech-to-speech agent is live!")
-        print("   Press Ctrl+C to stop the server.")
-        
-        await asyncio.Event().wait() 
-    except Exception as e:
-        logger.error(f"Failed to start server: {e}", exc_info=True)
-    finally:
-        await on_shutdown(app)
+    print("✅ Server started successfully on http://0.0.0.0:7860")
+    print("🚀 Your speech-to-speech agent is live!")
+    print("   Press Ctrl+C to stop the server.")
+    
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
     try:
