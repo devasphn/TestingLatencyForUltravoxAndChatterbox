@@ -40,20 +40,20 @@ logging.getLogger('torch').setLevel(logging.WARNING)
 
 # --- Global Variables ---
 uv_pipe, tts_model, vad_model = None, None, None
-executor = ThreadPoolExecutor(max_workers=4) # Reduced workers to prevent overload if needed
-pcs = weakref.WeakSet() # To keep track of active peer connections
+executor = ThreadPoolExecutor(max_workers=4)
+pcs = weakref.WeakSet()
 
 # --- Constants ---
 SAMPLE_RATE_VAD = 16000
-SAMPLE_RATE_TTS_INPUT = 24000 # Chatterbox input sample rate
-SAMPLE_RATE_OUTPUT = 48000 # WebRTC audio output sample rate
+SAMPLE_RATE_TTS_INPUT = 24000
+SAMPLE_RATE_OUTPUT = 48000
 VAD_MIN_SPEECH_DURATION_MS = 250
 VAD_MIN_SILENCE_DURATION_MS = 150
-AUDIO_PROCESS_INTERVAL_MS = 400 # How often to check buffer for processing (in ms)
-AUDIO_MAX_INPUT_DURATION_SEC = 5.0 # Max duration of audio to send to Ultravox at once
-TTS_MAX_DURATION_SEC = 10.0 # Max duration of TTS output
-ULTRAVOX_MAX_NEW_TOKENS = 80 # Conservative token limit for Ultravox
-ULTRAVOX_AUDIO_CHUNK_SIZE_SAMPLES = int(SAMPLE_RATE_VAD * 0.5) # Process audio chunks of 0.5s
+AUDIO_PROCESS_INTERVAL_MS = 400
+AUDIO_MAX_INPUT_DURATION_SEC = 5.0
+TTS_MAX_DURATION_SEC = 10.0
+ULTRAVOX_MAX_NEW_TOKENS = 80
+ULTRAVOX_AUDIO_CHUNK_SIZE_SAMPLES = int(SAMPLE_RATE_VAD * 0.5)
 
 # Enhanced HTML with connection stability improvements
 HTML_CLIENT = """
@@ -92,7 +92,7 @@ HTML_CLIENT = """
     const startBtn = document.getElementById('startBtn');
     const stopBtn = document.getElementById('stopBtn');
     const statusDiv = document.getElementById('status');
-    let isSpeaking = false; // Track if AI is speaking for UI feedback
+    let isSpeaking = false;
 
     function updateStatus(message, className) { 
         statusDiv.textContent = message; 
@@ -113,9 +113,9 @@ HTML_CLIENT = """
                     echoCancellation: false,
                     noiseSuppression: false,
                     autoGainControl: false,
-                    sampleRate: 48000, // Request 48kHz for better input quality
+                    sampleRate: 48000,
                     channelCount: 1,
-                    latency: { ideal: 0.025, min: 0.010, max: 0.050 } // Lower latency
+                    latency: { ideal: 0.025, min: 0.010, max: 0.050 }
                 } 
             });
             
@@ -138,9 +138,9 @@ HTML_CLIENT = """
                     };
                     
                     remoteAudio.onended = () => {
-                        if(isSpeaking) { // Only change status if it was speaking
+                        if(isSpeaking) {
                             isSpeaking = false;
-                            setTimeout(() => { // Wait a moment for potential continuation or silence
+                            setTimeout(() => {
                                 if(!isSpeaking && pc && pc.connectionState === 'connected') {
                                     updateStatus('✅ Listening...', 'connected');
                                 }
@@ -163,14 +163,14 @@ HTML_CLIENT = """
 
             pc.onicecandidate = e => {
                 if (e.candidate && ws && ws.readyState === WebSocket.OPEN) {
-                    // Send candidate in a structured format
+                    // Send candidate with necessary properties
                     const candidate_data = {
                         type: 'ice-candidate',
                         candidate: {
                             candidate: e.candidate.candidate,
                             sdpMid: e.candidate.sdpMid,
                             sdpMLineIndex: e.candidate.sdpMLineIndex,
-                            usernameFragment: e.candidate.usernameFragment // Important for some ICE candidates
+                            usernameFragment: e.candidate.usernameFragment
                         }
                     };
                     ws.send(JSON.stringify(candidate_data));
@@ -185,21 +185,20 @@ HTML_CLIENT = """
                 } else if (state === 'connected') { 
                     updateStatus('✅ Listening...', 'connected'); 
                     stopBtn.disabled = false;
-                    reconnectAttempts = 0; // Reset reconnect attempts on successful connection
+                    reconnectAttempts = 0;
                 } else if (state === 'failed' || state === 'closed' || state === 'disconnected') {
-                    stop(); // Stop everything on connection loss
+                    stop();
                 }
             };
 
             const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
             ws = new WebSocket(`${protocol}//${location.host}/ws`);
-            ws.binaryType = 'arraybuffer'; // Expect binary data for audio frames
+            ws.binaryType = 'arraybuffer';
 
             ws.onopen = async () => {
                 console.log('WebSocket connected');
                 const offer = await pc.createOffer();
                 await pc.setLocalDescription(offer);
-                // Send offer as JSON with explicit type and sdp
                 ws.send(JSON.stringify({type: offer.type, sdp: offer.sdp}));
             };
 
@@ -215,12 +214,12 @@ HTML_CLIENT = """
                         console.log('Received ICE candidate from server.');
                         const candidate_data = data.candidate;
                         if (candidate_data) {
-                            // Construct RTCIceCandidate properly
+                            // Construct RTCIceCandidate properly from received data
                             const candidate = new RTCIceCandidate({
                                 candidate: candidate_data.candidate,
                                 sdpMid: candidate_data.sdpMid,
                                 sdpMLineIndex: candidate_data.sdpMLineIndex,
-                                usernameFragment: candidate_data.usernameFragment // Crucial for some candidates
+                                usernameFragment: candidate_data.usernameFragment
                             });
                             await pc.addIceCandidate(candidate);
                         } else {
@@ -231,7 +230,7 @@ HTML_CLIENT = """
                     }
                 } catch (err) {
                     console.error('WebSocket message error:', err);
-                    if (err instanceof SyntaxError) { // Handle malformed JSON
+                    if (err instanceof SyntaxError) {
                         console.error("Received non-JSON message:", e.data);
                     }
                 }
@@ -284,7 +283,6 @@ HTML_CLIENT = """
         stopBtn.disabled = true;
     }
 
-    // Prevent page unload issues
     window.addEventListener('beforeunload', stop);
 </script>
 </body>
@@ -292,9 +290,7 @@ HTML_CLIENT = """
 """
 
 # --- Utility Functions ---
-# Removed candidate_from_sdp as we now construct RTCIceCandidate directly in JS for simplicity.
-# If you need server-side parsing for some reason, the previous logic can be reinstated,
-# but it's handled in the frontend JS for this setup.
+# Removed candidate_from_sdp as it's handled directly in JS now for RTCIceCandidate construction.
 
 # --- Model Loading and VAD ---
 class SileroVAD:
@@ -318,7 +314,7 @@ class SileroVAD:
     def detect_speech(self, audio_tensor: torch.Tensor, sample_rate: int) -> bool:
         """Detects speech in an audio tensor using Silero VAD."""
         if self.model is None:
-            return True # Assume speech if VAD failed to load
+            return True
 
         try:
             if audio_tensor.dtype != torch.float32:
@@ -334,7 +330,7 @@ class SileroVAD:
             if audio_tensor.ndim == 1:
                 audio_tensor = audio_tensor.unsqueeze(0)
 
-            speech_timestamps = self.utils[0]( # get_speech_timestamps
+            speech_timestamps = self.utils[0](
                 audio_tensor,
                 self.model,
                 sampling_rate=sample_rate,
@@ -388,9 +384,9 @@ class AudioBuffer:
         self.max_samples = int(AUDIO_MAX_INPUT_DURATION_SEC * sample_rate)
         self.buffer = collections.deque(maxlen=self.max_samples)
         self.last_process_check_time = time.time()
-        self.min_speech_samples_for_vad = int(0.8 * sample_rate) # Minimum audio length to run VAD
-        self.process_interval_sec = AUDIO_PROCESS_INTERVAL_MS / 1000.0 # Interval to check buffer
-        self.silence_threshold_norm = 0.005 # Normalized silence threshold
+        self.min_speech_samples_for_vad = int(0.8 * sample_rate)
+        self.process_interval_sec = AUDIO_PROCESS_INTERVAL_MS / 1000.0
+        self.silence_threshold_norm = 0.005
 
     def add_audio(self, audio_data: np.ndarray):
         """Adds raw audio data (expected to be normalized float32)."""
@@ -452,15 +448,15 @@ class ResponseAudioTrack(MediaStreamTrack):
     
     def __init__(self):
         super().__init__()
-        self._audio_queue = asyncio.Queue() # Queue for incoming audio chunks
+        self._audio_queue = asyncio.Queue()
         self._current_chunk = None
         self._chunk_pos = 0
         self._timestamp = 0
         self._time_base = fractions.Fraction(1, SAMPLE_RATE_OUTPUT)
-        self._frame_samples = 960  # 20ms at 48kHz
+        self._frame_samples = 960
         self._total_samples_to_send = 0
         self._samples_sent_in_chunk = 0
-        self._is_active = False # Flag indicating if there's audio to send
+        self._is_active = False
 
     async def recv(self):
         """Receives an audio frame to send to the client."""
@@ -545,13 +541,13 @@ class AudioProcessor:
     gets response, generates TTS, and streams it back via ResponseAudioTrack.
     """
     def __init__(self, output_track: ResponseAudioTrack, executor: ThreadPoolExecutor):
-        self.input_track = None # The incoming audio stream track
-        self.output_track = output_track # The track to send TTS audio
+        self.input_track = None
+        self.output_track = output_track
         self.audio_buffer = AudioBuffer(SAMPLE_RATE_VAD)
         self._processor_task = None
         self.executor = executor
-        self._is_processing_speech = False # Flag to prevent concurrent speech processing
-        self._ai_is_speaking = False # Flag to indicate if TTS is playing
+        self._is_processing_speech = False
+        self._ai_is_speaking = False
         self._processing_lock = asyncio.Lock()
         self._speaking_lock = asyncio.Lock()
         self._stop_event = asyncio.Event()
@@ -843,7 +839,9 @@ async def websocket_handler(request):
                         candidate_data = data.get("candidate")
                         if candidate_data:
                             try:
-                                # Construct RTCIceCandidate properly
+                                # Construct RTCIceCandidate properly from received data
+                                # Make sure all expected fields are present. The `candidate` field
+                                # itself holds the ICE string, and other fields are metadata.
                                 candidate = RTCIceCandidate(
                                     candidate=candidate_data.get("candidate"),
                                     sdpMid=candidate_data.get("sdpMid"),
