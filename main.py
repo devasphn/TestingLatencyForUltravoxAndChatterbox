@@ -163,7 +163,7 @@ HTML_CLIENT = """
 
             pc.onicecandidate = e => {
                 if (e.candidate && ws && ws.readyState === WebSocket.OPEN) {
-                    // Send candidate with necessary properties
+                    // Correctly structure ICE candidate data for sending
                     const candidate_data = {
                         type: 'ice-candidate',
                         candidate: {
@@ -213,8 +213,9 @@ HTML_CLIENT = """
                     } else if (msg_type === 'ice-candidate') {
                         console.log('Received ICE candidate from server.');
                         const candidate_data = data.candidate;
-                        if (candidate_data) {
-                            // Construct RTCIceCandidate properly from received data
+                        if (candidate_data && candidate_data.candidate) {
+                            // Construct RTCIceCandidate directly using the provided properties
+                            // The 'candidate' property here is the string itself.
                             const candidate = new RTCIceCandidate({
                                 candidate: candidate_data.candidate,
                                 sdpMid: candidate_data.sdpMid,
@@ -223,7 +224,7 @@ HTML_CLIENT = """
                             });
                             await pc.addIceCandidate(candidate);
                         } else {
-                            console.error('Received ICE candidate message without candidate data.');
+                            console.error('Received ICE candidate message without valid candidate data.');
                         }
                     } else {
                         console.log(`Received unknown message type: ${msg_type}`);
@@ -837,22 +838,24 @@ async def websocket_handler(request):
                     elif msg_type == "ice-candidate":
                         logger.info("Received ICE candidate from client.")
                         candidate_data = data.get("candidate")
-                        if candidate_data:
+                        if candidate_data and candidate_data.candidate:
                             try:
-                                # Construct RTCIceCandidate properly from received data
-                                # Make sure all expected fields are present. The `candidate` field
-                                # itself holds the ICE string, and other fields are metadata.
+                                # CRITICAL FIX: Construct RTCIceCandidate correctly.
+                                # The RTCIceCandidate constructor expects the ICE candidate string itself
+                                # as the first argument, and then metadata like sdpMid, sdpMLineIndex, etc.
+                                # The `candidate` field within `candidate_data` is the actual ICE string.
                                 candidate = RTCIceCandidate(
-                                    candidate=candidate_data.get("candidate"),
+                                    candidate_data.get("candidate"), # The actual ICE candidate string
                                     sdpMid=candidate_data.get("sdpMid"),
                                     sdpMLineIndex=candidate_data.get("sdpMLineIndex"),
                                     usernameFragment=candidate_data.get("usernameFragment")
                                 )
                                 await pc.addIceCandidate(candidate)
                             except Exception as e:
+                                # Log the error and the data that caused it for debugging.
                                 logger.error(f"Failed to create and add RTCIceCandidate: {e}. Data: {candidate_data}", exc_info=True)
                         else:
-                            logger.warning("Received ICE candidate message without candidate data.")
+                            logger.warning("Received ICE candidate message without valid candidate data.")
 
                 except json.JSONDecodeError:
                     logger.error(f"Received malformed JSON from WebSocket: {msg.data}")
