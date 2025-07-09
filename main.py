@@ -9,6 +9,7 @@ import collections
 import time
 import librosa
 from concurrent.futures import ThreadPoolExecutor
+import threading
 
 from aiohttp import web, WSMsgType
 from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack, RTCIceCandidate, RTCConfiguration, RTCIceServer, mediastreams
@@ -34,10 +35,10 @@ logging.getLogger('aiortc').setLevel(logging.WARNING)
 
 # --- Global Variables & HTML ---
 uv_pipe, tts_model, vad_model = None, None, None
-executor = ThreadPoolExecutor(max_workers=4)
+executor = ThreadPoolExecutor(max_workers=6)
 pcs = set()
 
-# [HTML_CLIENT remains the same - no changes needed]
+# Enhanced HTML with better audio constraints
 HTML_CLIENT = """
 <!DOCTYPE html>
 <html>
@@ -84,14 +85,18 @@ HTML_CLIENT = """
             const audioContext = new (window.AudioContext || window.webkitAudioContext)();
             if (audioContext.state === 'suspended') { await audioContext.resume(); }
 
+            // Enhanced audio constraints for better quality
             localStream = await navigator.mediaDevices.getUserMedia({ 
                 audio: { 
-                    echoCancellation: true, 
-                    noiseSuppression: true,
-                    autoGainControl: true,
-                    sampleRate: 48000
+                    echoCancellation: false,
+                    noiseSuppression: false,
+                    autoGainControl: false,
+                    sampleRate: 48000,
+                    channelCount: 1,
+                    volume: 1.0
                 } 
             });
+            
             pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
             
             localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
@@ -175,24 +180,25 @@ def candidate_from_sdp(candidate_string: str) -> dict:
 def parse_ultravox_response(result):
     try:
         if isinstance(result, str): 
-            return result
+            return result.strip()
         elif isinstance(result, list) and len(result) > 0:
             item = result[0]
             if isinstance(item, str): 
-                return item
+                return item.strip()
             elif isinstance(item, dict):
-                # Handle different possible response formats
                 if 'generated_text' in item: 
-                    return item['generated_text']
+                    return item['generated_text'].strip()
                 elif 'text' in item:
-                    return item['text']
+                    return item['text'].strip()
                 elif 'response' in item:
-                    return item['response']
+                    return item['response'].strip()
         elif isinstance(result, dict):
             if 'generated_text' in result:
-                return result['generated_text']
+                return result['generated_text'].strip()
             elif 'text' in result:
-                return result['text']
+                return result['text'].strip()
+            elif 'response' in result:
+                return result['response'].strip()
         return ""
     except Exception as e:
         logger.error(f"Error parsing Ultravox response: {e}")
@@ -215,22 +221,27 @@ class SileroVAD:
             return True
         try:
             if isinstance(audio_tensor, np.ndarray): 
-                audio_tensor = torch.from_numpy(audio_tensor.copy())
+                audio_tensor = torch.from_numpy(audio_tensor.copy()).float()
             
-            # Ensure tensor is float32 and properly normalized
+            # Ensure proper tensor format
             if audio_tensor.dtype != torch.float32:
                 audio_tensor = audio_tensor.float()
             
+            # Normalize audio if needed
+            if audio_tensor.abs().max() > 1.0:
+                audio_tensor = audio_tensor / audio_tensor.abs().max()
+            
             # Check if audio is too quiet
-            if audio_tensor.abs().max() < 0.01: 
+            if audio_tensor.abs().max() < 0.005: 
                 return False
             
             speech_timestamps = self.get_speech_timestamps(
                 audio_tensor, 
                 self.model, 
                 sampling_rate=sample_rate, 
-                min_speech_duration_ms=200,  # Reduced for better responsiveness
-                min_silence_duration_ms=100
+                min_speech_duration_ms=150,
+                min_silence_duration_ms=100,
+                return_seconds=False
             )
             return len(speech_timestamps) > 0
         except Exception as e:
@@ -268,26 +279,27 @@ def initialize_models():
 
 # --- Audio Processing Classes ---
 class AudioBuffer:
-    def __init__(self, max_duration=4.0, sample_rate=16000):  # Increased buffer duration
+    def __init__(self, max_duration=5.0, sample_rate=16000):
         self.sample_rate = sample_rate
         self.max_samples = int(max_duration * sample_rate)
         self.buffer = collections.deque(maxlen=self.max_samples)
         self.last_process_time = time.time()
-        self.min_speech_samples = int(0.3 * sample_rate)  # Reduced minimum speech duration
-        self.process_interval = 0.3  # Reduced interval for better responsiveness
+        self.min_speech_samples = int(0.5 * sample_rate)  # 500ms minimum
+        self.process_interval = 0.4  # Process every 400ms
+        self.silence_threshold = 0.004  # Increased sensitivity
     
     def add_audio(self, audio_data):
-        # Improved audio normalization
+        """Add audio data to buffer with proper normalization"""
         if audio_data.dtype != np.float32:
-            audio_data = audio_data.astype(np.float32) / 32768.0
-        
-        # Ensure proper normalization
+            audio_data = audio_data.astype(np.float32)
+            
+        # Normalize if needed
         max_val = np.abs(audio_data).max()
         if max_val > 1.0:
             audio_data = audio_data / max_val
-        elif max_val > 0:
-            # Gentle amplification for quiet audio
-            audio_data = audio_data * min(2.0, 0.5 / max_val)
+        elif max_val > 0 and max_val < 0.1:
+            # Amplify quiet audio
+            audio_data = audio_data * min(3.0, 0.3 / max_val)
             
         self.buffer.extend(audio_data.flatten())
 
@@ -296,12 +308,14 @@ class AudioBuffer:
     
     def should_process(self):
         current_time = time.time()
-        if len(self.buffer) > self.min_speech_samples and (current_time - self.last_process_time) > self.process_interval:
+        if (len(self.buffer) >= self.min_speech_samples and 
+            (current_time - self.last_process_time) >= self.process_interval):
+            
             self.last_process_time = current_time
             audio_array = self.get_audio_array()
             
-            # More sensitive threshold for quiet speech
-            if np.abs(audio_array).max() < 0.003: 
+            # Check if audio is above silence threshold
+            if np.abs(audio_array).max() < self.silence_threshold:
                 return False
                 
             return vad_model.detect_speech(audio_array, self.sample_rate)
@@ -312,6 +326,7 @@ class AudioBuffer:
 
 class ResponseAudioTrack(MediaStreamTrack):
     kind = "audio"
+    
     def __init__(self):
         super().__init__()
         self._queue = asyncio.Queue()
@@ -319,40 +334,60 @@ class ResponseAudioTrack(MediaStreamTrack):
         self._chunk_pos = 0
         self._timestamp = 0
         self._time_base = fractions.Fraction(1, 48000)
+        self._frame_samples = 960  # 20ms at 48kHz
+        self._lock = asyncio.Lock()
 
     async def recv(self):
-        frame_samples = 960
-        frame = np.zeros(frame_samples, dtype=np.int16)
-        
-        if self._current_chunk is None or self._chunk_pos >= len(self._current_chunk):
-            try:
-                self._current_chunk = await asyncio.wait_for(self._queue.get(), timeout=0.01)
-                self._chunk_pos = 0
-            except asyncio.TimeoutError:
-                pass
-        
-        if self._current_chunk is not None:
-            end_pos = self._chunk_pos + frame_samples
-            chunk_part = self._current_chunk[self._chunk_pos:end_pos]
-            frame[:len(chunk_part)] = chunk_part
-            self._chunk_pos += len(chunk_part)
-        
-        audio_frame = av.AudioFrame.from_ndarray(np.array([frame]), format="s16", layout="mono")
-        audio_frame.pts = self._timestamp
-        audio_frame.sample_rate = 48000
-        self._timestamp += frame_samples
-        return audio_frame
+        async with self._lock:
+            frame = np.zeros(self._frame_samples, dtype=np.int16)
+            
+            # Fill frame with audio data
+            filled_samples = 0
+            while filled_samples < self._frame_samples:
+                if self._current_chunk is None or self._chunk_pos >= len(self._current_chunk):
+                    try:
+                        self._current_chunk = await asyncio.wait_for(self._queue.get(), timeout=0.01)
+                        self._chunk_pos = 0
+                    except asyncio.TimeoutError:
+                        break
+                
+                if self._current_chunk is not None:
+                    remaining_frame = self._frame_samples - filled_samples
+                    remaining_chunk = len(self._current_chunk) - self._chunk_pos
+                    copy_samples = min(remaining_frame, remaining_chunk)
+                    
+                    frame[filled_samples:filled_samples + copy_samples] = \
+                        self._current_chunk[self._chunk_pos:self._chunk_pos + copy_samples]
+                    
+                    filled_samples += copy_samples
+                    self._chunk_pos += copy_samples
+            
+            # Create audio frame with proper timing
+            audio_frame = av.AudioFrame.from_ndarray(
+                np.array([frame]), 
+                format="s16", 
+                layout="mono"
+            )
+            audio_frame.pts = self._timestamp
+            audio_frame.sample_rate = 48000
+            audio_frame.time_base = self._time_base
+            
+            self._timestamp += self._frame_samples
+            return audio_frame
 
     async def queue_audio(self, audio_float32):
-        if audio_float32.size > 0:
-            # Improved audio conversion with clipping protection
-            audio_int16 = np.clip(audio_float32 * 32767, -32767, 32767).astype(np.int16)
+        """Queue audio with proper chunking"""
+        if audio_float32.size == 0:
+            return
             
-            # Split into smaller chunks for smoother playback
-            chunk_size = 4800  # 100ms chunks at 48kHz
-            for i in range(0, len(audio_int16), chunk_size):
-                chunk = audio_int16[i:i + chunk_size]
-                await self._queue.put(chunk)
+        # Convert to int16 with proper clipping
+        audio_int16 = np.clip(audio_float32 * 32767, -32767, 32767).astype(np.int16)
+        
+        # Split into optimal chunks for smooth playback
+        chunk_size = 2400  # 50ms chunks at 48kHz
+        for i in range(0, len(audio_int16), chunk_size):
+            chunk = audio_int16[i:i + chunk_size]
+            await self._queue.put(chunk)
 
 class AudioProcessor:
     def __init__(self, output_track: ResponseAudioTrack, executor: ThreadPoolExecutor):
@@ -362,7 +397,8 @@ class AudioProcessor:
         self.task = None
         self.executor = executor
         self.is_speaking = False
-        self.processing_lock = asyncio.Lock()  # Prevent concurrent processing
+        self.processing_lock = asyncio.Lock()
+        self.speech_lock = threading.Lock()
 
     def add_track(self, track): 
         self.track = track
@@ -381,12 +417,12 @@ class AudioProcessor:
     async def _run(self):
         try:
             while True:
-                # Echo cancellation: skip processing while AI is speaking
+                # Skip processing while AI is speaking
                 if self.is_speaking:
                     try:
-                        await asyncio.wait_for(self.track.recv(), timeout=0.01)
+                        await asyncio.wait_for(self.track.recv(), timeout=0.005)
                     except asyncio.TimeoutError:
-                        await asyncio.sleep(0.01)
+                        await asyncio.sleep(0.005)
                     continue
 
                 try: 
@@ -395,10 +431,16 @@ class AudioProcessor:
                     logger.warning("Client media stream ended.")
                     break
                 
-                # Improved audio processing
-                audio_float32 = frame.to_ndarray().flatten().astype(np.float32) / 32768.0
+                # Process audio frame
+                audio_data = frame.to_ndarray().flatten()
                 
-                # High-quality resampling
+                # Convert to float32 and normalize
+                if audio_data.dtype == np.int16:
+                    audio_float32 = audio_data.astype(np.float32) / 32768.0
+                else:
+                    audio_float32 = audio_data.astype(np.float32)
+                
+                # High-quality resampling to 16kHz
                 if frame.sample_rate != 16000:
                     resampled_audio = librosa.resample(
                         audio_float32, 
@@ -411,13 +453,12 @@ class AudioProcessor:
                 
                 self.buffer.add_audio(resampled_audio)
                 
-                if self.buffer.should_process():
-                    # Use lock to prevent concurrent processing
-                    if not self.processing_lock.locked():
-                        audio_to_process = self.buffer.get_audio_array()
-                        self.buffer.reset()
-                        logger.info(f"🧠 Processing {len(audio_to_process)} samples...")
-                        asyncio.create_task(self.process_speech(audio_to_process))
+                # Process when buffer is ready
+                if self.buffer.should_process() and not self.processing_lock.locked():
+                    audio_to_process = self.buffer.get_audio_array()
+                    self.buffer.reset()
+                    logger.info(f"🧠 Processing {len(audio_to_process)} samples (max: {np.abs(audio_to_process).max():.4f})")
+                    asyncio.create_task(self.process_speech(audio_to_process))
                         
         except asyncio.CancelledError: 
             pass
@@ -425,19 +466,36 @@ class AudioProcessor:
             logger.error(f"Audio processor error: {e}", exc_info=True)
         finally: 
             logger.info("Audio processor stopped.")
-            
+
     def _blocking_tts(self, text: str) -> np.ndarray:
+        """Generate TTS with streaming support"""
         try:
-            logger.info(f"🗣️ Generating TTS for: '{text}'")
+            logger.info(f"🗣️ Generating TTS for: '{text[:50]}...'")
+            
             with torch.inference_mode():
-                wav = tts_model.generate(text).cpu().numpy().flatten()
+                # Use streaming generation if available
+                if hasattr(tts_model, 'generate_stream'):
+                    audio_chunks = []
+                    for audio_chunk, metrics in tts_model.generate_stream(
+                        text, 
+                        chunk_size=25,
+                        exaggeration=0.5,
+                        cfg_weight=0.5
+                    ):
+                        audio_chunks.append(audio_chunk)
+                    
+                    if audio_chunks:
+                        wav = torch.cat(audio_chunks, dim=-1).cpu().numpy().flatten()
+                    else:
+                        wav = tts_model.generate(text).cpu().numpy().flatten()
+                else:
+                    wav = tts_model.generate(text).cpu().numpy().flatten()
                 
-                # Ensure we have audio output
                 if wav.size == 0:
                     logger.warning("TTS generated empty audio")
                     return np.array([], dtype=np.float32)
                 
-                # High-quality resampling from 24kHz to 48kHz
+                # High-quality resampling
                 resampled_wav = librosa.resample(
                     wav.astype(np.float32), 
                     orig_sr=24000, 
@@ -453,76 +511,92 @@ class AudioProcessor:
             return np.array([], dtype=np.float32)
 
     async def process_speech(self, audio_array):
+        """Process speech with improved Ultravox handling"""
         async with self.processing_lock:
             try:
-                # Improved audio preprocessing for Ultravox
+                # Prepare audio for Ultravox
                 audio_array = audio_array.astype(np.float32)
                 
-                # Normalize audio properly
+                # Ensure proper normalization for Ultravox
                 max_val = np.abs(audio_array).max()
                 if max_val > 1.0:
                     audio_array = audio_array / max_val
                 elif max_val > 0 and max_val < 0.1:
-                    # Amplify quiet audio
+                    # Gentle amplification for quiet audio
                     audio_array = audio_array * (0.3 / max_val)
                 
                 # Ensure 1D array
                 if audio_array.ndim > 1:
                     audio_array = audio_array.flatten()
                 
-                # Ensure minimum length for Ultravox
+                # Minimum length check
                 if len(audio_array) < 8000:  # 0.5 seconds at 16kHz
                     logger.info("Audio too short for processing")
                     return
                 
-                logger.info(f"🎤 Audio stats: length={len(audio_array)}, max={np.abs(audio_array).max():.4f}")
+                # Pad to ensure consistent length
+                target_length = max(16000, len(audio_array))  # At least 1 second
+                if len(audio_array) < target_length:
+                    audio_array = np.pad(audio_array, (0, target_length - len(audio_array)), 'constant')
                 
-                # Call Ultravox with improved parameters
+                logger.info(f"🎤 Processing audio: length={len(audio_array)}, max={np.abs(audio_array).max():.4f}, mean={np.mean(np.abs(audio_array)):.4f}")
+                
+                # Call Ultravox with enhanced parameters
                 with torch.inference_mode():
+                    ultravox_input = {
+                        'audio': audio_array, 
+                        'turns': [], 
+                        'sampling_rate': 16000
+                    }
+                    
                     result = uv_pipe(
-                        {
-                            'audio': audio_array, 
-                            'turns': [], 
-                            'sampling_rate': 16000
-                        }, 
-                        max_new_tokens=150,  # Increased for longer responses
+                        ultravox_input, 
+                        max_new_tokens=200,
                         do_sample=True,
                         temperature=0.7,
-                        top_p=0.9
+                        top_p=0.9,
+                        repetition_penalty=1.1
                     )
 
-                response_text = parse_ultravox_response(result).strip()
+                response_text = parse_ultravox_response(result)
                 if not response_text:
                     logger.info("No response generated by Ultravox.")
                     return
 
                 logger.info(f"🤖 AI Response: '{response_text}'")
 
-                # Generate TTS
-                loop = asyncio.get_running_loop()
-                resampled_wav = await loop.run_in_executor(self.executor, self._blocking_tts, response_text)
-
-                if resampled_wav.size > 0:
-                    # Set speaking state
+                # Set speaking state before TTS generation
+                with self.speech_lock:
                     self.is_speaking = True
-                    logger.info("🤖 AI is speaking...")
                     
-                    # Queue audio for playback
-                    await self.output_track.queue_audio(resampled_wav)
+                try:
+                    # Generate TTS
+                    loop = asyncio.get_running_loop()
+                    resampled_wav = await loop.run_in_executor(self.executor, self._blocking_tts, response_text)
 
-                    # Calculate playback duration and wait
-                    playback_duration = resampled_wav.size / 48000
-                    await asyncio.sleep(playback_duration + 0.2)  # Extra buffer for safety
+                    if resampled_wav.size > 0:
+                        logger.info("🤖 AI is speaking...")
+                        
+                        # Queue audio for playback
+                        await self.output_track.queue_audio(resampled_wav)
 
-                    # Reset speaking state
-                    self.is_speaking = False
-                    logger.info("✅ AI finished speaking, now listening.")
-                else:
-                    logger.warning("TTS generated empty audio.")
+                        # Calculate accurate playback duration
+                        playback_duration = resampled_wav.size / 48000
+                        await asyncio.sleep(playback_duration + 0.3)  # Buffer for complete playback
+
+                        logger.info("✅ AI finished speaking, now listening.")
+                    else:
+                        logger.warning("TTS generated empty audio.")
+                        
+                finally:
+                    # Always reset speaking state
+                    with self.speech_lock:
+                        self.is_speaking = False
 
             except Exception as e:
                 logger.error(f"Speech processing error: {e}", exc_info=True)
-                self.is_speaking = False
+                with self.speech_lock:
+                    self.is_speaking = False
 
 # --- WebRTC and WebSocket Handling ---
 async def websocket_handler(request):
