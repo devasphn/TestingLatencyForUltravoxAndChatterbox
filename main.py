@@ -163,13 +163,12 @@ HTML_CLIENT = """
 
             pc.onicecandidate = e => {
                 if (e.candidate && ws && ws.readyState === WebSocket.OPEN) {
-                    // Correctly structure ICE candidate data for sending
+                    // Structure ICE candidate data for sending.
+                    // Crucially, `candidate` here is the KEY for the actual ICE string.
                     const candidate_data = {
                         type: 'ice-candidate',
-                        // The 'candidate' key here holds the actual ICE string from e.candidate.candidate
-                        // and other metadata like sdpMid and sdpMLineIndex.
                         candidate: {
-                            candidate: e.candidate.candidate,
+                            candidate: e.candidate.candidate, // The ICE string itself
                             sdpMid: e.candidate.sdpMid,
                             sdpMLineIndex: e.candidate.sdpMLineIndex,
                             usernameFragment: e.candidate.usernameFragment
@@ -206,7 +205,7 @@ HTML_CLIENT = """
 
             ws.onmessage = async e => {
                 try {
-                    const data = JSON.parse(e.data);
+                    const data = JSON.loads(e.data);
                     const msg_type = data.type;
 
                     if (msg_type === 'answer') {
@@ -214,25 +213,27 @@ HTML_CLIENT = """
                         await pc.setRemoteDescription(new RTCSessionDescription(data));
                     } else if (msg_type === 'ice-candidate') {
                         console.log('Received ICE candidate from server.');
-                        // Get the inner object containing candidate details
-                        const candidate_data = data.candidate; 
+                        // `data.candidate` should be the object containing the ICE string.
+                        const candidate_data_from_server = data.candidate; 
                         
-                        // Check if the 'candidate' key (which is the ICE string) exists
-                        if (candidate_data && candidate_data.candidate) {
+                        // Ensure we have the necessary parts of the ICE candidate from the server.
+                        // The 'candidate' key within `candidate_data_from_server` holds the actual ICE string.
+                        if (candidate_data_from_server && typeof candidate_data_from_server.candidate === 'string') {
                             try {
-                                // Construct RTCIceCandidate using the correct properties
+                                // Construct RTCIceCandidate using the properties from the server's data.
+                                // The first argument is the ICE string itself.
                                 const candidate = new RTCIceCandidate({
-                                    candidate: candidate_data.candidate, // This is the ICE string itself
-                                    sdpMid: candidate_data.sdpMid,
-                                    sdpMLineIndex: candidate_data.sdpMLineIndex,
-                                    usernameFragment: candidate_data.usernameFragment
+                                    candidate: candidate_data_from_server.candidate,
+                                    sdpMid: candidate_data_from_server.sdpMid,
+                                    sdpMLineIndex: candidate_data_from_server.sdpMLineIndex,
+                                    usernameFragment: candidate_data_from_server.usernameFragment
                                 });
                                 await pc.addIceCandidate(candidate);
                             } catch (e) {
-                                logger.error(f"Failed to create and add RTCIceCandidate: {e}. Data: {candidate_data}", exc_info=True);
+                                logger.error(f"Failed to create and add RTCIceCandidate: {e}. Data: {candidate_data_from_server}", exc_info=True);
                             }
                         } else {
-                            console.error('Received ICE candidate message without valid candidate data.');
+                            console.error('Received ICE candidate message with invalid or missing "candidate" string. Data:', candidate_data_from_server);
                         }
                     } else {
                         console.log(`Received unknown message type: ${msg_type}`);
@@ -845,25 +846,26 @@ async def websocket_handler(request):
                     
                     elif msg_type == "ice-candidate":
                         logger.info("Received ICE candidate from client.")
-                        # `data` is the parsed JSON. `data.candidate` should be the object
-                        # containing the actual ICE string and metadata.
-                        candidate_data = data.get("candidate") 
+                        # `data.candidate` is expected to be the object containing the ICE candidate details.
+                        candidate_data_from_server = data.get("candidate") 
                         
-                        # IMPORTANT FIX: Check if `candidate_data` is a dictionary AND if it contains the 'candidate' key (the ICE string itself)
-                        if isinstance(candidate_data, dict) and 'candidate' in candidate_data:
+                        # Ensure we have the correct structure: `candidate_data_from_server` must be an object
+                        # AND it must contain the `candidate` key (which is the actual ICE string).
+                        if isinstance(candidate_data_from_server, dict) and 'candidate' in candidate_data_from_server:
                             try:
-                                # Construct RTCIceCandidate using the correct properties from the dictionary
+                                # Construct RTCIceCandidate using the properties from the server's data.
+                                # The `candidate` key holds the ICE string.
                                 candidate = RTCIceCandidate(
-                                    candidate_data.get("candidate"), # This is the actual ICE candidate string
-                                    sdpMid=candidate_data.get("sdpMid"),
-                                    sdpMLineIndex=candidate_data.get("sdpMLineIndex"),
-                                    usernameFragment=candidate_data.get("usernameFragment")
+                                    candidate_data_from_server.get("candidate"), # The ICE string
+                                    sdpMid=candidate_data_from_server.get("sdpMid"),
+                                    sdpMLineIndex=candidate_data_from_server.get("sdpMLineIndex"),
+                                    usernameFragment=candidate_data_from_server.get("usernameFragment")
                                 )
                                 await pc.addIceCandidate(candidate)
                             except Exception as e:
-                                logger.error(f"Failed to create and add RTCIceCandidate: {e}. Data: {candidate_data}", exc_info=True)
+                                logger.error(f"Failed to create and add RTCIceCandidate: {e}. Data: {candidate_data_from_server}", exc_info=True)
                         else:
-                            logger.error(f"Received ICE candidate message with invalid or missing 'candidate' data. Data: {candidate_data}")
+                            logger.error(f"Received ICE candidate message with invalid or missing 'candidate' data. Data: {candidate_data_from_server}")
 
                 except json.JSONDecodeError:
                     logger.error(f"Received malformed JSON from WebSocket: {msg.data}")
